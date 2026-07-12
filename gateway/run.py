@@ -1794,6 +1794,70 @@ _OWN_POLICY_OPEN_ENV = {
 }
 
 
+# Builtin env vars whose presence indicates a configured user allowlist or an
+# explicit allow-all opt-in. Kept here (not in feishu_authorization) because
+# this is a gateway-wide startup concern, not Feishu-specific parsing.
+_BUILTIN_ALLOWED_USERS_ENV = (
+    "TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
+    "WHATSAPP_ALLOWED_USERS", "WHATSAPP_CLOUD_ALLOWED_USERS",
+    "SLACK_ALLOWED_USERS",
+    "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
+    "TELEGRAM_GROUP_ALLOWED_USERS",
+    "TELEGRAM_GROUP_ALLOWED_CHATS",
+    "EMAIL_ALLOWED_USERS",
+    "SMS_ALLOWED_USERS", "MATTERMOST_ALLOWED_USERS",
+    "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
+    "FEISHU_ALLOWED_USERS",
+    "WECOM_ALLOWED_USERS",
+    "WECOM_CALLBACK_ALLOWED_USERS",
+    "WEIXIN_ALLOWED_USERS",
+    "BLUEBUBBLES_ALLOWED_USERS",
+    "QQ_ALLOWED_USERS",
+    "YUANBAO_ALLOWED_USERS",
+    "GATEWAY_ALLOWED_USERS",
+)
+_BUILTIN_ALLOW_ALL_ENV = (
+    "TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
+    "WHATSAPP_ALLOW_ALL_USERS", "WHATSAPP_CLOUD_ALLOW_ALL_USERS",
+    "SLACK_ALLOW_ALL_USERS",
+    "SIGNAL_ALLOW_ALL_USERS", "EMAIL_ALLOW_ALL_USERS",
+    "SMS_ALLOW_ALL_USERS", "MATTERMOST_ALLOW_ALL_USERS",
+    "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS",
+    "FEISHU_ALLOW_ALL_USERS",
+    "WECOM_ALLOW_ALL_USERS",
+    "WECOM_CALLBACK_ALLOW_ALL_USERS",
+    "WEIXIN_ALLOW_ALL_USERS",
+    "BLUEBUBBLES_ALLOW_ALL_USERS",
+    "QQ_ALLOW_ALL_USERS",
+    "YUANBAO_ALLOW_ALL_USERS",
+)
+
+
+def _warn_if_no_user_allowlist(
+    *,
+    plugin_allowed_vars: tuple = (),
+    plugin_allow_all_vars: tuple = (),
+) -> bool:
+    """Return True when the startup "no allowlist configured" warning should fire.
+
+    A valid, nonempty ``FEISHU_GROUP_ALLOWED_CHATS`` room set counts as a
+    configured allowlist (parsed strictly by
+    :func:`gateway.feishu_authorization.parse_feishu_group_allowed_chats`).
+    Malformed/blank values do NOT count — they are not added to the generic
+    truthy builtin-var check, so a typo'd room list still warns.
+    """
+    from gateway.feishu_authorization import parse_feishu_group_allowed_chats
+
+    any_allowlist = any(
+        os.getenv(v) for v in _BUILTIN_ALLOWED_USERS_ENV + tuple(plugin_allowed_vars)
+    ) or bool(parse_feishu_group_allowed_chats())
+    allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"} or any(
+        os.getenv(v, "").lower() in {"true", "1", "yes"}
+        for v in _BUILTIN_ALLOW_ALL_ENV + tuple(plugin_allow_all_vars)
+    )
+    return not any_allowlist and not allow_all
+
+
 def _own_policy_open_startup_violation(config) -> Optional[str]:
     """Return a startup-abort reason when open policy lacks allow-all opt-in."""
     for platform, platform_config in getattr(config, "platforms", {}).items():
@@ -6820,40 +6884,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         
         # Warn if no user allowlists are configured and open access is not opted in
-        _builtin_allowed_vars = (
-            "TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
-            "WHATSAPP_ALLOWED_USERS", "WHATSAPP_CLOUD_ALLOWED_USERS",
-            "SLACK_ALLOWED_USERS",
-            "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
-            "TELEGRAM_GROUP_ALLOWED_USERS",
-            "TELEGRAM_GROUP_ALLOWED_CHATS",
-            "EMAIL_ALLOWED_USERS",
-            "SMS_ALLOWED_USERS", "MATTERMOST_ALLOWED_USERS",
-            "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
-            "FEISHU_ALLOWED_USERS",
-            "WECOM_ALLOWED_USERS",
-            "WECOM_CALLBACK_ALLOWED_USERS",
-            "WEIXIN_ALLOWED_USERS",
-            "BLUEBUBBLES_ALLOWED_USERS",
-            "QQ_ALLOWED_USERS",
-            "YUANBAO_ALLOWED_USERS",
-            "GATEWAY_ALLOWED_USERS",
-        )
-        _builtin_allow_all_vars = (
-            "TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
-            "WHATSAPP_ALLOW_ALL_USERS", "WHATSAPP_CLOUD_ALLOW_ALL_USERS",
-            "SLACK_ALLOW_ALL_USERS",
-            "SIGNAL_ALLOW_ALL_USERS", "EMAIL_ALLOW_ALL_USERS",
-            "SMS_ALLOW_ALL_USERS", "MATTERMOST_ALLOW_ALL_USERS",
-            "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS",
-            "FEISHU_ALLOW_ALL_USERS",
-            "WECOM_ALLOW_ALL_USERS",
-            "WECOM_CALLBACK_ALLOW_ALL_USERS",
-            "WEIXIN_ALLOW_ALL_USERS",
-            "BLUEBUBBLES_ALLOW_ALL_USERS",
-            "QQ_ALLOW_ALL_USERS",
-            "YUANBAO_ALLOW_ALL_USERS",
-        )
         # Also pick up plugin-registered platforms — each entry can declare
         # its own allowed_users_env / allow_all_env, so the warning stays
         # accurate as plugins like IRC come online.
@@ -6871,14 +6901,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
-        _any_allowlist = any(
-            os.getenv(v) for v in _builtin_allowed_vars + _plugin_allowed_vars
-        )
-        _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"} or any(
-            os.getenv(v, "").lower() in {"true", "1", "yes"}
-            for v in _builtin_allow_all_vars + _plugin_allow_all_vars
-        )
-        if not _any_allowlist and not _allow_all:
+        if _warn_if_no_user_allowlist(
+            plugin_allowed_vars=_plugin_allowed_vars,
+            plugin_allow_all_vars=_plugin_allow_all_vars,
+        ):
             logger.warning(
                 "No env user allowlists configured. Messaging platforms default to "
                 "pairing/allowlist policies and will deny unknown senders unless you "

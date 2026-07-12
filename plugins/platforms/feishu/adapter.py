@@ -129,6 +129,7 @@ FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
 from gateway.config import Platform, PlatformConfig
+from gateway.feishu_authorization import is_feishu_group_chat_allowed
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -4312,6 +4313,13 @@ class FeishuAdapter(BasePlatformAdapter):
         # (bots were already cleared upstream by FEISHU_ALLOW_BOTS).
         if policy == "disabled":
             return False
+        # Listed room bypass: an operator-listed Feishu room grants room-scoped
+        # access, bypassing sender allowlists/admin policy. Bot traffic was
+        # already gated by FEISHU_ALLOW_BOTS in _admit; mention enforcement
+        # runs after _allow_group_message in _admit. ``disabled`` above stays
+        # absolute, so a listed room never overrides a disabled group policy.
+        if is_feishu_group_chat_allowed(chat_id):
+            return True
         if policy == "open":
             return True
         if policy == "admin_only":

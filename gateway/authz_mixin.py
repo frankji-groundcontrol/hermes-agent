@@ -21,6 +21,7 @@ import os
 from typing import Optional
 
 from gateway.config import Platform
+from gateway.feishu_authorization import is_feishu_group_chat_allowed
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
@@ -315,6 +316,27 @@ class GatewayAuthorizationMixin:
             return True
 
         user_id = source.user_id
+
+        # Feishu listed-room bypass (room-scoped authorization). A listed
+        # group/forum room grants access independently of the sender allowlists
+        # below, but both absolute gates still deny first: a disabled group
+        # policy never admits, and a bot/app sender is only admitted when
+        # FEISHU_ALLOW_BOTS is explicitly in {mentions, all} (the adapter
+        # normalizes unset/malformed values to ``none``). Runs before the
+        # generic {PLATFORM}_ALLOW_BOTS grant and other allowlists so neither
+        # can bypass ``disabled``. Mention enforcement is an adapter concern
+        # and is not re-checked here.
+        if (
+            source.platform == Platform.FEISHU
+            and source.chat_type in {"group", "forum"}
+            and is_feishu_group_chat_allowed(source.chat_id)
+        ):
+            if os.getenv("FEISHU_GROUP_POLICY", "allowlist").strip().lower() == "disabled":
+                return False
+            allow_bots = os.getenv("FEISHU_ALLOW_BOTS", "none").strip().lower()
+            if source.is_bot and allow_bots not in {"mentions", "all"}:
+                return False
+            return True
 
         # Telegram (and similar) authorize entire group/forum/channel chats
         # by chat ID via TELEGRAM_GROUP_ALLOWED_CHATS / QQ_GROUP_ALLOWED_USERS.
