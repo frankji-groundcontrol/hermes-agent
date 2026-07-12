@@ -4613,6 +4613,509 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["final_response"] == "Recovered after remint"
 
+    @pytest.mark.parametrize("provider", ["custom", "custom:qwen-relay"])
+    def test_custom_provider_retries_rejected_developer_role_once_as_system(
+        self, agent, provider
+    ):
+        self._setup_agent(agent)
+        agent.provider = provider
+        agent.api_mode = "chat_completions"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+        roles = []
+
+        class _DeveloperRoleError(RuntimeError):
+            status_code = 400
+
+        def _fake_api_call(api_kwargs):
+            roles.append(api_kwargs["messages"][0]["role"])
+            if len(roles) == 1:
+                raise _DeveloperRoleError(
+                    "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"
+                )
+            return _mock_response(content="Fallback worked", finish_reason="stop")
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert roles == ["developer", "system"]
+        assert result["completed"] is True
+        assert result["final_response"] == "Fallback worked"
+
+    # ── Streaming, tool-loop, hook, and history coverage ──────────────────
+
+    def test_custom_developer_role_retry_streaming_before_output(self, agent):
+        """Streaming 400 that arrives before any delta still retries as system."""
+        self._setup_agent(agent)
+        agent.provider = "custom:qwen-relay"
+        agent.api_mode = "chat_completions"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+        roles = []
+
+        class _DeveloperRoleError(RuntimeError):
+            status_code = 400
+
+        def _fake_streaming_call(api_kwargs, *, on_first_delta=None):
+            roles.append(api_kwargs["messages"][0]["role"])
+            if len(roles) == 1:
+                # 400 lands BEFORE any streamed delta — must not fire the callback.
+                raise _DeveloperRoleError(
+                    "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"
+                )
+            return _mock_response(content="Streamed fallback", finish_reason="stop")
+
+        with (
+            patch.object(agent, "_has_stream_consumers", return_value=True),
+            patch.object(
+                agent,
+                "_interruptible_streaming_api_call",
+                side_effect=_fake_streaming_call,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert roles == ["developer", "system"]
+        assert result["completed"] is True
+        assert result["final_response"] == "Streamed fallback"
+
+    def test_custom_developer_role_retry_in_tool_loop(self, agent):
+        """A tool call completes, then the next API call's 400 retries as system."""
+        self._setup_agent(agent)
+        agent.provider = "custom:qwen-relay"
+        agent.api_mode = "chat_completions"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+        roles = []
+
+        class _DeveloperRoleError(RuntimeError):
+            status_code = 400
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+
+        def _fake_api_call(api_kwargs):
+            roles.append(api_kwargs["messages"][0]["role"])
+            if len(roles) == 1:
+                return _mock_response(
+                    content="", finish_reason="tool_calls", tool_calls=[tc]
+                )
+            if len(roles) == 2:
+                raise _DeveloperRoleError(
+                    "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"
+                )
+            return _mock_response(content="Tool loop recovered", finish_reason="stop")
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert roles == ["developer", "developer", "system"]
+        assert result["completed"] is True
+        assert result["final_response"] == "Tool loop recovered"
+
+    def test_custom_developer_role_retry_hooks(self, agent):
+        """pre_api_request sees developer then system; api_request_error sees the 400."""
+        self._setup_agent(agent)
+        agent.provider = "custom:qwen-relay"
+        agent.api_mode = "chat_completions"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+
+        class _DeveloperRoleError(RuntimeError):
+            status_code = 400
+
+        def _fake_api_call(api_kwargs):
+            role = api_kwargs["messages"][0]["role"]
+            if role == "developer":
+                raise _DeveloperRoleError(
+                    "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"
+                )
+            return _mock_response(content="Hook fallback", finish_reason="stop")
+
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch(
+                "hermes_cli.plugins.has_hook",
+                side_effect=lambda n: n in {"pre_api_request", "api_request_error"},
+            ),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        pre_request_calls = [kw for name, kw in hook_calls if name == "pre_api_request"]
+        error_hook_calls = [kw for name, kw in hook_calls if name == "api_request_error"]
+        assert len(pre_request_calls) == 2
+        assert [c["api_call_count"] for c in pre_request_calls] == [1, 1]
+        assert [
+            c["request"]["body"]["messages"][0]["role"] for c in pre_request_calls
+        ] == ["developer", "system"]
+        assert len(error_hook_calls) == 1
+        assert error_hook_calls[0]["status_code"] == 400
+
+    def test_custom_developer_role_retry_preserves_canonical_history(self, agent):
+        """Retry rewrites only the wire copy; canonical history and prompt are intact."""
+        self._setup_agent(agent)
+        agent.provider = "custom:qwen-relay"
+        agent.api_mode = "chat_completions"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+        cached_before = agent._cached_system_prompt
+
+        class _DeveloperRoleError(RuntimeError):
+            status_code = 400
+
+        def _fake_api_call(api_kwargs):
+            if api_kwargs["messages"][0]["role"] == "developer":
+                raise _DeveloperRoleError(
+                    "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"
+                )
+            return _mock_response(content="ok", finish_reason="stop")
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        # No synthetic user/system turn is injected into canonical history.
+        assert [m["role"] for m in result["messages"]] == ["user", "assistant"]
+        # Cached system prompt is untouched by the compatibility retry.
+        assert agent._cached_system_prompt == cached_before
+
+    # ── Negative matrix: each non-matching case must NOT compatibility-retry ──
+
+    @pytest.mark.parametrize(
+        ("provider", "model", "status_code", "err_text"),
+        [
+            pytest.param(
+                "custom:qwen-relay", "gpt-5.5", 422,
+                "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']",
+                id="non-400-status-with-matching-text",
+            ),
+            pytest.param(
+                "custom:qwen-relay", "gpt-5.5", 400,
+                "totally unrelated provider error message",
+                id="400-with-unrelated-text",
+            ),
+            pytest.param(
+                "openrouter", "gpt-5.4", 400,
+                "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']",
+                id="non-custom-provider",
+            ),
+        ],
+    )
+    def test_custom_developer_role_retry_negative_no_retry(
+        self, agent, provider, model, status_code, err_text
+    ):
+        self._setup_agent(agent)
+        agent.provider = provider
+        agent.api_mode = "chat_completions"
+        agent.model = model
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+        roles = []
+
+        class _Err(RuntimeError):
+            pass
+
+        def _fake_api_call(api_kwargs):
+            roles.append(api_kwargs["messages"][0]["role"])
+            _e = _Err(err_text)
+            _e.status_code = status_code
+            raise _e
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+        ):
+            result = agent.run_conversation("hello")
+
+        # No developer→system compatibility retry signature may appear.
+        compat_retry_fired = any(
+            roles[i] == "developer"
+            and i + 1 < len(roles)
+            and roles[i + 1] == "system"
+            for i in range(len(roles))
+        )
+        assert not compat_retry_fired
+        assert result["completed"] is False
+
+    def test_custom_developer_role_retry_negative_first_wire_role_system(
+        self, agent
+    ):
+        """When the wire first role is already 'system' (no gpt-5 swap), no retry."""
+        self._setup_agent(agent)
+        agent.provider = "custom:qwen-relay"
+        agent.api_mode = "chat_completions"
+        # qwen-max is not in DEVELOPER_ROLE_MODELS, so the swap never fires.
+        agent.model = "qwen-max"
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+        roles = []
+
+        class _DeveloperRoleError(RuntimeError):
+            status_code = 400
+
+        def _fake_api_call(api_kwargs):
+            roles.append(api_kwargs["messages"][0]["role"])
+            raise _DeveloperRoleError(
+                "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"
+            )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert roles  # at least one call happened
+        assert all(r == "system" for r in roles)
+        assert result["completed"] is False
+
+    @pytest.mark.parametrize(
+        "messages_kwargs",
+        [
+            pytest.param({"messages": []}, id="empty-messages"),
+            pytest.param({}, id="missing-messages"),
+        ],
+    )
+    def test_custom_developer_role_retry_negative_missing_or_empty_messages(
+        self, agent, messages_kwargs
+    ):
+        self._setup_agent(agent)
+        agent.provider = "custom:qwen-relay"
+        agent.api_mode = "chat_completions"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+        roles = []
+
+        class _DeveloperRoleError(RuntimeError):
+            status_code = 400
+
+        def _fake_api_call(api_kwargs):
+            msgs = api_kwargs.get("messages") or []
+            if msgs:
+                roles.append(msgs[0].get("role"))
+            raise _DeveloperRoleError(
+                "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"
+            )
+
+        with (
+            patch.object(
+                agent,
+                "_build_api_kwargs",
+                return_value={"model": "gpt-5.5", **messages_kwargs},
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert "system" not in roles
+        assert result["completed"] is False
+
+    def test_custom_developer_role_retry_negative_request_build_failure(self, agent):
+        """A matching 400 raised before api_kwargs is a dict cannot compatibility-retry."""
+        self._setup_agent(agent)
+        agent.provider = "custom:qwen-relay"
+        agent.api_mode = "chat_completions"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+        # No API call is ever reached: building the request itself fails, so
+        # api_kwargs is None on the failing attempt and the wire-messages guard
+        # (isinstance(api_kwargs, dict)) correctly blocks the compatibility retry.
+        api_calls = []
+
+        class _DeveloperRoleError(RuntimeError):
+            status_code = 400
+
+        def _fake_build(api_messages):
+            raise _DeveloperRoleError(
+                "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"
+            )
+
+        with (
+            patch.object(agent, "_build_api_kwargs", side_effect=_fake_build),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=lambda kw: api_calls.append(kw),
+            ),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert api_calls == []  # no request was ever sent, hence no system retry
+        assert result["completed"] is False
+
+    def test_custom_developer_role_retry_negative_output_before_400(self, agent):
+        """If streaming already emitted output, the matching 400 is not retried."""
+        self._setup_agent(agent)
+        agent.provider = "custom:qwen-relay"
+        agent.api_mode = "chat_completions"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+        roles = []
+
+        class _DeveloperRoleError(RuntimeError):
+            status_code = 400
+
+        def _fake_streaming_call(api_kwargs, *, on_first_delta=None):
+            roles.append(api_kwargs["messages"][0]["role"])
+            # Output already streamed before the 400 lands — guard must trip.
+            if on_first_delta is not None:
+                on_first_delta()
+            raise _DeveloperRoleError(
+                "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"
+            )
+
+        with (
+            patch.object(agent, "_has_stream_consumers", return_value=True),
+            patch.object(
+                agent,
+                "_interruptible_streaming_api_call",
+                side_effect=_fake_streaming_call,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        compat_retry_fired = any(
+            roles[i] == "developer"
+            and i + 1 < len(roles)
+            and roles[i + 1] == "system"
+            for i in range(len(roles))
+        )
+        assert not compat_retry_fired
+        assert result["completed"] is False
+
+    def test_custom_developer_role_retry_once_then_rejected_again(self, agent):
+        """After the one system retry, a repeated developer-rejection does not retry twice."""
+        self._setup_agent(agent)
+        agent.provider = "custom:qwen-relay"
+        agent.api_mode = "chat_completions"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+        roles = []
+
+        class _DeveloperRoleError(RuntimeError):
+            status_code = 400
+
+        def _fake_api_call(api_kwargs):
+            roles.append(api_kwargs["messages"][0]["role"])
+            raise _DeveloperRoleError(
+                "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"
+            )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Exactly one compatibility retry: developer (rejected) → system (rejected again).
+        assert roles[0] == "developer"
+        assert roles[1] == "system"
+        assert roles.count("system") == 1
+        assert result["completed"] is False
+
+    def test_custom_developer_role_retry_once_then_different_error(self, agent):
+        """After the one system retry, a different upstream error is handled normally."""
+        self._setup_agent(agent)
+        agent.provider = "custom:qwen-relay"
+        agent.api_mode = "chat_completions"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://custom.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "custom.example.com"
+        roles = []
+
+        class _DeveloperRoleError(RuntimeError):
+            status_code = 400
+
+        class _ServerError(RuntimeError):
+            status_code = 500
+
+        def _fake_api_call(api_kwargs):
+            role = api_kwargs["messages"][0]["role"]
+            roles.append(role)
+            if role == "developer":
+                raise _DeveloperRoleError(
+                    "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"
+                )
+            raise _ServerError("upstream blew up")
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert roles[0] == "developer"
+        assert roles[1] == "system"
+        assert roles.count("system") == 1
+        assert result["completed"] is False
+
     def test_context_compression_triggered(self, agent):
         """When compressor says should_compress, compression runs."""
         self._setup_agent(agent)

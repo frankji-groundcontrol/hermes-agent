@@ -1102,6 +1102,13 @@ def run_conversation(
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
+        # ponytail: one-shot compatibility retry state for custom providers
+        # that reject the OpenAI ``developer`` role. Reset per outer API call
+        # so a prior turn's rejection can't leak into this one. Only the wire
+        # request copy is rewritten; canonical ``api_messages`` is untouched.
+        _developer_role_retry_messages = None
+        _developer_role_retry_attempted = False
+
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
@@ -1153,6 +1160,7 @@ def run_conversation(
                 except Exception:
                     pass  # Never let rate guard break the agent loop
 
+            _api_output_started = False
             try:
                 agent._reset_stream_delivery_tracking()
                 # api_messages is built once, before this retry loop, while the
@@ -1202,6 +1210,18 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+
+                # Apply the saved developer→system compatibility retry payload
+                # AFTER request middleware, and only to the wire ``api_kwargs``
+                # copy — never to canonical ``api_messages``. Building a fresh
+                # dict keeps the cached middleware payload intact.
+                if _developer_role_retry_messages is not None:
+                    api_kwargs = {
+                        **api_kwargs,
+                        "messages": _developer_role_retry_messages,
+                    }
+                    _developer_role_retry_messages = None
+                    _developer_role_retry_attempted = True
 
                 try:
                     from hermes_cli.plugins import (
@@ -1274,8 +1294,9 @@ def run_conversation(
                 # consumers are registered, and falls back to non-
                 # streaming automatically if the provider doesn't
                 # support it.
-                def _stop_spinner():
-                    nonlocal thinking_spinner
+                def _on_first_output():
+                    nonlocal thinking_spinner, _api_output_started
+                    _api_output_started = True
                     if thinking_spinner:
                         thinking_spinner.stop("")
                         thinking_spinner = None
@@ -1326,7 +1347,7 @@ def run_conversation(
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                            next_api_kwargs, on_first_delta=_on_first_output
                         )
                     return agent._interruptible_api_call(next_api_kwargs)
 
@@ -2623,6 +2644,44 @@ def run_conversation(
                     retryable=classified.retryable,
                     reason=classified.reason.value,
                 )
+
+                # ── Custom provider developer-role compatibility retry ──────
+                # Some OpenAI-compatible custom relays reject the ``developer``
+                # role (GPT-5/Codex system-role swap) with HTTP 400
+                # "developer is not one of ['system','assistant','user',...]".
+                # Retry exactly once, rewriting only the outgoing wire copy's
+                # first role back to ``system``. Detected AFTER cleanup,
+                # classification, and the api_request_error hook so hooks,
+                # accounting, and the spinner stay correct. Guard against any
+                # output already streamed so a partial response is never
+                # silently discarded. One retry only; retry_count is not
+                # consumed — a second failure falls through to normal handling.
+                _wire_messages = (
+                    api_kwargs.get("messages")
+                    if isinstance(api_kwargs, dict)
+                    else None
+                )
+                if (
+                    not _developer_role_retry_attempted
+                    and _developer_role_retry_messages is None
+                    and _err_status == 400
+                    and "developer is not one of" in _err_lower
+                    and (agent.provider or "").split(":", 1)[0] == "custom"
+                    and isinstance(_wire_messages, list)
+                    and _wire_messages
+                    and isinstance(_wire_messages[0], dict)
+                    and _wire_messages[0].get("role") == "developer"
+                    and not _api_output_started
+                ):
+                    _developer_role_retry_messages = [
+                        {**_wire_messages[0], "role": "system"},
+                        *_wire_messages[1:],
+                    ]
+                    logger.info(
+                        "Custom provider rejected the developer role; retrying once as system. %s",
+                        agent._client_log_context(),
+                    )
+                    continue
 
                 if (
                     classified.reason == FailoverReason.billing
