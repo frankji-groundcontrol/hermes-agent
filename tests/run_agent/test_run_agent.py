@@ -4615,13 +4615,18 @@ class TestRunConversation:
 
     @pytest.mark.parametrize("provider", ["custom", "custom:qwen-relay"])
     def test_custom_provider_retries_rejected_developer_role_once_as_system(
-        self, agent, provider
+        self, agent, provider, caplog
     ):
         self._setup_agent(agent)
         agent.provider = provider
         agent.api_mode = "chat_completions"
         agent.model = "gpt-5.5"
-        agent.base_url = "https://custom.example.com/v1"
+        query_marker = "synthetic-query-marker"
+        fragment_marker = "synthetic-fragment-marker"
+        agent.base_url = (
+            "https://custom.example.com/v1?trace="
+            f"{query_marker}#{fragment_marker}"
+        )
         agent._base_url_lower = agent.base_url.lower()
         agent._base_url_hostname = "custom.example.com"
         roles = []
@@ -4642,10 +4647,16 @@ class TestRunConversation:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            caplog.at_level(logging.INFO, logger="agent.conversation_loop"),
         ):
             result = agent.run_conversation("hello")
 
         assert roles == ["developer", "system"]
+        assert query_marker not in caplog.text
+        assert fragment_marker not in caplog.text
+        assert "base_url=https://custom.example.com/v1" in caplog.text
+        assert query_marker in agent.base_url
+        assert fragment_marker in agent.base_url
         assert result["completed"] is True
         assert result["final_response"] == "Fallback worked"
 

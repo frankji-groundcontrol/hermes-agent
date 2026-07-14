@@ -3883,10 +3883,11 @@ class AIAgent:
     def _client_log_context(self) -> str:
         provider = getattr(self, "provider", "unknown")
         base_url = getattr(self, "base_url", "unknown")
+        display_base_url = str(base_url).split("?", 1)[0].split("#", 1)[0]
         model = getattr(self, "model", "unknown")
         return (
             f"thread={self._thread_identity()} provider={provider} "
-            f"base_url={base_url} model={model}"
+            f"base_url={display_base_url} model={model}"
         )
 
     def _openai_client_lock(self) -> threading.RLock:
