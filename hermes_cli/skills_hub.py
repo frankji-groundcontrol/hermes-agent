@@ -28,6 +28,57 @@ from agent.skill_utils import is_excluded_skill_path
 _console = Console()
 
 
+def _inspect_local_skill(identifier: str) -> Optional[dict]:
+    """Return an installed local skill by frontmatter name, if present."""
+    if "/" in identifier or "\\" in identifier:
+        return None
+
+    from tools.skills_hub import SKILLS_DIR
+
+    direct = SKILLS_DIR / identifier / "SKILL.md"
+    candidates = [direct] if direct.is_file() else []
+    candidates.extend(path for path in SKILLS_DIR.rglob("SKILL.md") if path != direct)
+    for skill_md in candidates:
+        if is_excluded_skill_path(skill_md):
+            continue
+        try:
+            content = skill_md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        name = re.search(r'^name:\s*["\']?([^\n"\']+)', content, re.MULTILINE)
+        if not name or name.group(1).strip() != identifier:
+            continue
+        description = re.search(r'^description:\s*["\']?([^\n"\']+)', content, re.MULTILINE)
+        return {
+            "name": identifier,
+            "description": description.group(1).strip() if description else "",
+            "identifier": f"local/{identifier}",
+            "content": content,
+        }
+    return None
+
+
+def _print_local_skill(c: Console, skill: dict) -> None:
+    """Render a local skill in the same shape as a hub inspection."""
+    c.print()
+    c.print(Panel(
+        "\n".join([
+            f"[bold]Name:[/] {skill['name']}",
+            f"[bold]Description:[/] {skill['description']}",
+            "[bold]Source:[/] local",
+            "[bold]Trust:[/] local",
+            f"[bold]Identifier:[/] {skill['identifier']}",
+        ]),
+        title=f"Skill: {skill['name']}",
+    ))
+    lines = skill["content"].split("\n")
+    preview = "\n".join(lines[:50])
+    if len(lines) > 50:
+        preview += f"\n\n... ({len(lines) - 50} more lines)"
+    c.print(Panel(preview, title="SKILL.md Preview"))
+    c.print()
+
+
 def _display_source(r) -> str:
     """Human-facing source label for a result row.
 
@@ -789,6 +840,11 @@ def do_inspect(identifier: str, console: Optional[Console] = None) -> None:
     from tools.skills_hub import GitHubAuth, create_source_router
 
     c = console or _console
+    local_skill = _inspect_local_skill(identifier)
+    if local_skill:
+        _print_local_skill(c, local_skill)
+        return
+
     auth = GitHubAuth()
     sources = create_source_router(auth)
 
@@ -886,6 +942,21 @@ def browse_skills(page: int = 1, page_size: int = 20, source: str = "all") -> di
 def inspect_skill(identifier: str) -> Optional[dict]:
     """Skill metadata (+ SKILL.md preview) for programmatic callers."""
     from tools.skills_hub import GitHubAuth, create_source_router
+
+    local_skill = _inspect_local_skill(identifier)
+    if local_skill:
+        lines = local_skill["content"].split("\n")
+        preview = "\n".join(lines[:50])
+        if len(lines) > 50:
+            preview += f"\n\n... ({len(lines) - 50} more lines)"
+        return {
+            "name": local_skill["name"],
+            "description": local_skill["description"],
+            "source": "local",
+            "identifier": local_skill["identifier"],
+            "tags": [],
+            "skill_md_preview": preview,
+        }
 
     class _Q:
         def print(self, *a, **k):

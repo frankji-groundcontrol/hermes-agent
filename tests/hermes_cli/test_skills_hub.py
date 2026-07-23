@@ -5,7 +5,7 @@ import pytest
 from rich.console import Console
 
 from cli import ChatConsole
-from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash
+from hermes_cli.skills_hub import do_check, do_inspect, do_install, do_list, do_update, handle_skills_slash
 
 
 class _DummyLockFile:
@@ -151,6 +151,26 @@ def test_do_list_filter_builtin(three_source_env):
 
     assert "builtin-skill" in output
     assert "hub-skill" not in output
+
+
+def test_do_inspect_reads_an_installed_local_skill_before_registry_lookup(monkeypatch, hub_env):
+    import tools.skills_hub as hub
+
+    skill_dir = hub.SKILLS_DIR / "daily-knowledge-synthesis"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: daily-knowledge-synthesis\ndescription: Inspect local snapshots.\n---\n\n# Local skill\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hub, "create_source_router", lambda _auth: pytest.fail("registry lookup"))
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    do_inspect("daily-knowledge-synthesis", console=console)
+
+    output = sink.getvalue()
+    assert "daily-knowledge-synthesis" in output
+    assert "Source: local" in output
     assert "local-skill" not in output
 
 
@@ -780,4 +800,3 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     assert payload[0]["source"] == "browse-sh"
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
-
