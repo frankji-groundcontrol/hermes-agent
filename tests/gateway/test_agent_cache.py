@@ -425,6 +425,13 @@ class TestExtractCacheBustingConfig:
         assert parse_calls == [config_path]
 
         config_path.write_text("{\n  \"changed\": true\n}")
+        # The memo keys on st_mtime_ns, and file timestamps advance in ~1 ms
+        # granules while this test runs in well under that — so the rewrite often
+        # lands in the same granule, the memo hits, and no re-parse happens.
+        # Force mtime strictly forward so the edit is actually observable.
+        import os as _os
+        _st = config_path.stat()
+        _os.utime(config_path, ns=(_st.st_atime_ns, _st.st_mtime_ns + 10_000_000))
         third = GatewayRunner._extract_honcho_cache_busting_config()
 
         assert third == first

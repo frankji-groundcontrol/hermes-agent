@@ -510,8 +510,15 @@ def find_node_executable_on_path(command: str) -> str | None:
             if not directory:
                 continue
             candidate = Path(directory) / name
-            if candidate.is_file():
-                return str(candidate)
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError:
+                # An unreadable PATH entry (EACCES on a root-owned dir, a dead
+                # network mount, ...) must not abort the whole search — is_file()
+                # only swallows ENOENT/ENOTDIR/EBADF/ELOOP. shutil.which, used on
+                # the non-Windows branch above, already skips these silently.
+                continue
     return None
 
 

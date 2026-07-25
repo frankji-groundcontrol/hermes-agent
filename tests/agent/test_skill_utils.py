@@ -169,7 +169,13 @@ def test_skill_config_raw_cache_invalidates_on_config_edit(tmp_path, monkeypatch
 
     config_path.write_text("skills:\n  disabled: [new-skill]\n", encoding="utf-8")
     import os
-    os.utime(config_path, None)
+    # The raw-config cache keys on (path, st_mtime_ns, st_size). Both bodies are
+    # the same length, and file timestamps here advance in ~1 ms granules while
+    # this test runs in well under that — so `os.utime(path, None)` (UTIME_NOW)
+    # is a no-op inside a tick and the stale parse gets served. Push mtime
+    # forward explicitly so the cache key genuinely differs.
+    bumped = config_path.stat().st_mtime + 1
+    os.utime(config_path, (bumped, bumped))
 
     assert get_disabled_skill_names() == {"new-skill"}
 

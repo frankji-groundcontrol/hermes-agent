@@ -91,9 +91,17 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
+# HERMES_HOME must point somewhere disposable. conftest.py overrides it per-test,
+# but ~29 modules snapshot `get_hermes_home()` at *import* time (e.g.
+# tui_gateway/server.py), which happens during collection — before any fixture
+# runs. Without this, a developer's real ~/.hermes/config.yaml leaks into those
+# snapshots and fails tests that assume a pristine home (CI passes only because
+# CI has no ~/.hermes). Override HERMES_TEST_HOME to inspect the dir afterwards.
+HERMES_TEST_HOME="${HERMES_TEST_HOME:-$(mktemp -d)}"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  HERMES_HOME="$HERMES_TEST_HOME" \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \

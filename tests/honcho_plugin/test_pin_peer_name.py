@@ -16,6 +16,7 @@ chosen ``user_peer_id`` can be asserted without touching the network.
 
 import hashlib
 import json
+import os
 from unittest.mock import MagicMock
 
 
@@ -669,6 +670,30 @@ class TestPinUserPeerAlias:
         assert config.pin_peer_name is True
 
 
+_LAST_CFG_MTIME_NS: dict[str, int] = {}
+
+
+def _write_cfg_bumping_mtime(path, payload):
+    """Write ``payload`` and force this file's mtime strictly forward.
+
+    ``GatewayRunner._extract_honcho_cache_busting_config`` memoizes on
+    ``(path, st_mtime_ns)``. File timestamps advance in ~1 ms granules here while
+    an uncached extract costs ~0.15 ms, so two writes in one test normally land in
+    the same granule — the memo key is then identical for different content and
+    the second extract returns the first one's stale signature.
+
+    Bumping by a fixed offset off the *current* mtime is not enough: both writes
+    read back the same coarse clock, so both would land on the same bumped value.
+    Track the last value written per path and always step past it.
+    """
+    path.write_text(json.dumps(payload))
+    st = path.stat()
+    key = str(path)
+    target = max(st.st_mtime_ns, _LAST_CFG_MTIME_NS.get(key, 0) + 10_000_000)
+    os.utime(path, ns=(st.st_atime_ns, target))
+    _LAST_CFG_MTIME_NS[key] = target
+
+
 class TestPinTransition:
     """Behavior when honcho.json flips ``pinPeerName`` true → false.
 
@@ -744,10 +769,10 @@ class TestPinTransition:
         cfg_path = tmp_path / "honcho.json"
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-        cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor", "pinPeerName": True}))
+        _write_cfg_bumping_mtime(cfg_path, {"apiKey": "k", "peerName": "Igor", "pinPeerName": True})
         sig_pinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
-        cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor", "pinPeerName": False}))
+        _write_cfg_bumping_mtime(cfg_path, {"apiKey": "k", "peerName": "Igor", "pinPeerName": False})
         sig_unpinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         assert sig_pinned["honcho.pin_peer_name"] != sig_unpinned["honcho.pin_peer_name"]
@@ -758,14 +783,14 @@ class TestPinTransition:
         cfg_path = tmp_path / "honcho.json"
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-        cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor"}))
+        _write_cfg_bumping_mtime(cfg_path, {"apiKey": "k", "peerName": "Igor"})
         sig_no_aliases = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
-        cfg_path.write_text(json.dumps({
+        _write_cfg_bumping_mtime(cfg_path, {
             "apiKey": "k",
             "peerName": "Igor",
             "userPeerAliases": {"7654321": "Igor"},
-        }))
+        })
         sig_with_aliases = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         assert sig_no_aliases["honcho.user_peer_aliases"] != sig_with_aliases["honcho.user_peer_aliases"]
@@ -776,14 +801,14 @@ class TestPinTransition:
         cfg_path = tmp_path / "honcho.json"
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-        cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor"}))
+        _write_cfg_bumping_mtime(cfg_path, {"apiKey": "k", "peerName": "Igor"})
         sig_no_prefix = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
-        cfg_path.write_text(json.dumps({
+        _write_cfg_bumping_mtime(cfg_path, {
             "apiKey": "k",
             "peerName": "Igor",
             "runtimePeerPrefix": "telegram_",
-        }))
+        })
         sig_with_prefix = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         assert sig_no_prefix["honcho.runtime_peer_prefix"] != sig_with_prefix["honcho.runtime_peer_prefix"]
@@ -800,18 +825,18 @@ class TestPinTransition:
         cfg_path = tmp_path / "honcho.json"
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-        cfg_path.write_text(json.dumps({
+        _write_cfg_bumping_mtime(cfg_path, {
             "apiKey": "k",
             "peerName": "Igor",
             "aiPeer": "hermes",
-        }))
+        })
         sig_before = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
-        cfg_path.write_text(json.dumps({
+        _write_cfg_bumping_mtime(cfg_path, {
             "apiKey": "k",
             "peerName": "Igor",
             "aiPeer": "hermetika",
-        }))
+        })
         sig_after = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         assert sig_before["honcho.ai_peer"] != sig_after["honcho.ai_peer"]
