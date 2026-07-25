@@ -9211,3 +9211,33 @@ class TestMemoryProviderTurnStart:
         # The extracted body uses ``agent.X`` rather than ``self.X``;
         # assert the extracted-form spelling directly.
         assert "on_turn_start(agent._user_turn_count" in src
+
+
+class TestClientLogContextRedaction:
+    """`_client_log_context` feeds every OpenAI-client log line. A provider
+    base_url can legitimately carry credentials in its query string or fragment
+    (custom relays do this), so the context string must expose only the
+    scheme/host/path. This is a fork-carried guard with no upstream equivalent —
+    without it an upstream merge can silently reintroduce the raw f-string.
+    """
+
+    def _make_agent(self, base_url):
+        agent = object.__new__(AIAgent)
+        agent.provider = "custom"
+        agent.base_url = base_url
+        agent.model = "qwen-relay"
+        return agent
+
+    def test_query_and_fragment_are_stripped_from_logged_base_url(self):
+        agent = self._make_agent("https://relay.example/v1?key=SECRET#frag")
+
+        context = agent._client_log_context()
+
+        assert "SECRET" not in context
+        assert "frag" not in context
+        assert "base_url=https://relay.example/v1 " in context + " "
+
+    def test_plain_base_url_is_logged_unchanged(self):
+        agent = self._make_agent("https://relay.example/v1")
+
+        assert "base_url=https://relay.example/v1 " in agent._client_log_context() + " "
