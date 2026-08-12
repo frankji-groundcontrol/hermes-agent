@@ -2266,6 +2266,35 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         self.assertIn("[Mentioned: Alice (open_id=ou_alice), Bob (open_id=ou_bob)]", event.text)
         self.assertIn("@Alice @Bob make a group", event.text)
 
+    def test_leading_self_mention_injects_direct_mention_hint(self):
+        adapter = self._build_adapter()
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "@_user_1 summarize this"}),
+            message_type="text",
+            message_id="m_direct",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="m_direct",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertEqual(event.text, "[Direct mention]\n\nsummarize this")
+
     def test_command_message_never_injects_hint(self):
         adapter = self._build_adapter()
         bot_mention = SimpleNamespace(

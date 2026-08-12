@@ -1326,6 +1326,15 @@ def _strip_edge_self_mentions(
             return remaining
 
 
+def _has_leading_self_mention(text: str, mentions: Sequence[FeishuMentionRef]) -> bool:
+    remaining = text.lstrip()
+    return any(
+        remaining.startswith(name)
+        and (not (suffix := remaining[len(name):]) or suffix[0] in _MENTION_BOUNDARY_CHARS)
+        for name in (f"@{ref.name or ref.open_id or 'user'}" for ref in mentions if ref.is_self)
+    )
+
+
 def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     """Run the official Lark WS client in its own thread-local event loop."""
     import lark_oapi.ws.client as ws_client_module
@@ -3355,9 +3364,12 @@ class FeishuAdapter(BasePlatformAdapter):
         is_bot: bool = False,
     ) -> None:
         text, inbound_type, media_urls, media_types, mentions = await self._extract_message_content(message)
+        direct_mention = False
 
         if inbound_type == MessageType.TEXT:
-            text = _strip_edge_self_mentions(text, mentions)
+            direct_mention = _has_leading_self_mention(text, mentions)
+            stripped_text = _strip_edge_self_mentions(text, mentions)
+            text = stripped_text
             if text.startswith("/"):
                 inbound_type = MessageType.COMMAND
 
@@ -3368,6 +3380,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         if inbound_type != MessageType.COMMAND:
             hint = _build_mention_hint(mentions)
+            if direct_mention:
+                text = f"[Direct mention]\n\n{text}" if text else "[Direct mention]"
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
