@@ -10,6 +10,7 @@ All identifiers are synthetic (``oc_listed``, ``oc_unlisted``, ``ou_unknown``,
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -180,6 +181,53 @@ def _admit_group(adapter, *, chat_id: str, open_id: str = UNKNOWN_HUMAN,
 
 
 class TestAdapterTruthTable:
+    def test_profile_yaml_bot_policy_does_not_borrow_process_env(self, monkeypatch):
+        from agent import secret_scope
+        from plugins.platforms.feishu.adapter import FeishuAdapter, _apply_yaml_config
+
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
+        first_extra = _apply_yaml_config({}, {"allow_bots": "all"})
+        assert os.environ["FEISHU_ALLOW_BOTS"] == "all"
+
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        token = secret_scope.set_secret_scope({})
+        try:
+            second_extra = _apply_yaml_config({}, {"allow_bots": "none"})
+            second_settings = FeishuAdapter._load_settings(second_extra)
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+        assert second_extra == {"allow_bots": "none"}
+        assert second_settings.allow_bots == "none"
+        assert os.environ["FEISHU_ALLOW_BOTS"] == "all"
+
+    def test_load_settings_uses_profile_scoped_authorization(self, monkeypatch):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        monkeypatch.setenv("FEISHU_ALLOW_BOTS", "all")
+        monkeypatch.setenv("FEISHU_GROUP_POLICY", "open")
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_other_profile")
+        token = set_secret_scope({
+            "FEISHU_ALLOW_BOTS": "none",
+            "FEISHU_GROUP_POLICY": "disabled",
+            "FEISHU_ALLOWED_USERS": "ou_this_profile",
+            "FEISHU_REQUIRE_MENTION": "false",
+            "FEISHU_ALLOW_ALL_USERS": "false",
+            "GATEWAY_ALLOW_ALL_USERS": "false",
+        })
+        try:
+            settings = FeishuAdapter._load_settings({})
+        finally:
+            reset_secret_scope(token)
+
+        assert settings.allow_bots == "none"
+        assert settings.group_policy == "disabled"
+        assert settings.allowed_group_users == frozenset({"ou_this_profile"})
+        assert settings.require_mention is False
+        assert settings.allow_all_users is False
+        assert settings.gateway_allow_all_users is False
+
     def test_listed_group_unknown_human_with_mention_admitted(self, monkeypatch):
         _set_listed(monkeypatch)
         adapter = make_adapter_skeleton(group_policy="allowlist")
@@ -288,6 +336,22 @@ def _make_feishu_source(
 
 
 class TestGatewayTruthTable:
+    def test_adapter_snapshot_wins_over_another_profile_env(self, monkeypatch):
+        monkeypatch.setenv("FEISHU_GROUP_ALLOWED_CHATS", UNLISTED_ROOM)
+        runner = _make_bare_runner()
+        runner.adapters = {
+            Platform.FEISHU: SimpleNamespace(
+                _allowed_group_chats=frozenset({LISTED_ROOM}),
+                _group_policy="allowlist",
+                _allow_bots="none",
+            )
+        }
+
+        assert runner._is_user_authorized(_make_feishu_source()) is True
+        assert runner._is_user_authorized(
+            _make_feishu_source(chat_id=UNLISTED_ROOM)
+        ) is False
+
     def test_listed_human_group_non_disabled_policy_admitted(self, monkeypatch):
         _set_listed(monkeypatch)
         runner = _make_bare_runner()

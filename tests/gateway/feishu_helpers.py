@@ -6,6 +6,8 @@ import threading
 from types import SimpleNamespace
 from typing import Any, Optional
 
+from gateway.feishu_authorization import parse_feishu_group_allowed_chats
+
 
 def make_sender(sender_type: str = "user", open_id: str = "ou_human",
                 user_id: Optional[str] = None, union_id: Optional[str] = None) -> Any:
@@ -47,8 +49,11 @@ def make_adapter_skeleton(
     adapter._group_policy = group_policy
     adapter._default_group_policy = group_policy
     adapter._allowed_group_users = frozenset()
+    adapter._allowed_group_chats = parse_feishu_group_allowed_chats()
     adapter._allow_bots = allow_bots
     adapter._require_mention = require_mention
+    adapter._allow_all_users = False
+    adapter._gateway_allow_all_users = False
     return adapter
 
 
