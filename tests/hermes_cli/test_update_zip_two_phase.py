@@ -174,19 +174,22 @@ def test_no_open_coded_venv_layout_remains_in_hermes_cli():
     exempt = {"stdio.py"}
     pkg = Path(hermes_cli.__file__).parent
     offenders = []
-    for py in pkg.rglob("*.py"):
-        if py.name in exempt:
-            continue
-        try:
-            tree = ast.parse(py.read_text(encoding="utf-8", errors="replace"))
-        except SyntaxError:
-            continue
-        for node in ast.walk(tree):
-            # Any *code* string literal "Scripts" is a hand-rolled layout;
-            # docstrings and comments never reach ast.Constant in an expr
-            # position we care about here.
-            if isinstance(node, ast.Constant) and node.value == "Scripts":
-                offenders.append(f"{py.relative_to(pkg)}:{node.lineno}")
+    for root, dirs, files in os.walk(pkg):
+        dirs[:] = [name for name in dirs if name != "__pycache__"]
+        for name in files:
+            if not name.endswith(".py") or name in exempt:
+                continue
+            py = Path(root) / name
+            try:
+                tree = ast.parse(py.read_text(encoding="utf-8", errors="replace"))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                # Any *code* string literal "Scripts" is a hand-rolled layout;
+                # docstrings and comments never reach ast.Constant in an expr
+                # position we care about here.
+                if isinstance(node, ast.Constant) and node.value == "Scripts":
+                    offenders.append(f"{py.relative_to(pkg)}:{node.lineno}")
     assert not offenders, (
         "open-coded venv layout found (use hermes_constants.venv_bin_dir):\n"
         + "\n".join(offenders)
