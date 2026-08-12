@@ -1284,8 +1284,13 @@ class TestDoctorStaleMaxIterationsDrift:
             env_lines.append(f"HERMES_MAX_ITERATIONS={ghost}\n")
         (hermes_home / ".env").write_text("".join(env_lines), encoding="utf-8")
 
+        hermes_bin = tmp_path / "project" / "venv" / "bin" / "hermes"
+        hermes_bin.parent.mkdir(parents=True)
+        hermes_bin.write_text("#!/usr/bin/env python\n", encoding="utf-8")
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
         monkeypatch.setattr(doctor_mod, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+        monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
         # Point the config helpers at the temp home.
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         if os_environ_value is not None:
@@ -1326,6 +1331,9 @@ class TestDoctorStaleMaxIterationsDrift:
         env_after = (hermes_home / ".env").read_text(encoding="utf-8")
         assert "HERMES_MAX_ITERATIONS" not in env_after
         assert "OPENAI_API_KEY=sk-test" in env_after  # other keys preserved
+        assert (tmp_path / ".local" / "bin" / "hermes").resolve() == (
+            tmp_path / "project" / "venv" / "bin" / "hermes"
+        ).resolve()
 
 
     def test_no_drift_when_ghost_absent(self, monkeypatch, tmp_path):

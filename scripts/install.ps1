@@ -2709,25 +2709,74 @@ print(','.join(scripts))
     Write-Success "All dependencies installed"
 }
 
+function Get-HermesUserPathUpdate {
+    param(
+        [string]$CurrentPath,
+        [string]$HermesBin,
+        [string]$LegacyBin,
+        [bool]$RemoveLegacy
+    )
+
+    # PATH entries are literal directory names, not wildcard patterns.
+    # PowerShell's collection comparisons are case-insensitive for strings,
+    # so bracketed user paths work and sibling-prefix entries stay untouched.
+    $items = if ($CurrentPath) { @($CurrentPath -split ';') } else { @() }
+    $removedLegacy = $RemoveLegacy -and ($items -contains $LegacyBin)
+    if ($removedLegacy) {
+        $items = @($items | Where-Object { $_ -ne $LegacyBin })
+    }
+    $addedHermes = $items -notcontains $HermesBin
+    if ($addedHermes) {
+        $items = @($HermesBin) + $items
+    }
+
+    return @{
+        Path          = $items -join ';'
+        RemovedLegacy = $removedLegacy
+        AddedHermes   = $addedHermes
+    }
+}
+
 function Set-PathVariable {
     Write-Info "Setting up hermes command..."
     
     if ($NoVenv) {
         $hermesBin = "$InstallDir"
     } else {
-        $hermesBin = "$InstallDir\venv\Scripts"
+        # Expose ONLY the hermes launchers on PATH -- never the whole
+        # venv\Scripts directory. venv\Scripts contains python.exe /
+        # pythonw.exe / pip.exe, and putting it on the user PATH silently
+        # hijacks the `python` command in every terminal on the machine
+        # (#83797): unrelated projects start resolving python to Hermes'
+        # runtime interpreter. A dedicated bin dir with copies of the
+        # launcher exes keeps `hermes` globally available without
+        # shadowing anything. (Launcher exes embed the venv interpreter
+        # path, so they work from any location and survive updates.)
+        $hermesBin = "$InstallDir\bin"
+        New-Item -ItemType Directory -Force -Path $hermesBin | Out-Null
+        foreach ($launcher in @("hermes.exe", "hermes-acp.exe")) {
+            $src = "$InstallDir\venv\Scripts\$launcher"
+            if (Test-Path $src) {
+                Copy-Item -Force $src "$hermesBin\$launcher"
+            }
+        }
     }
     
-    # Add the venv Scripts dir to user PATH so hermes is globally available
-    # On Windows, the hermes.exe in venv\Scripts\ has the venv Python baked in
     $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    
-    if ($currentPath -notlike "*$hermesBin*") {
-        [Environment]::SetEnvironmentVariable(
-            "Path",
-            "$hermesBin;$currentPath",
-            "User"
-        )
+    $legacyBin = "$InstallDir\venv\Scripts"
+    $pathUpdate = Get-HermesUserPathUpdate `
+        -CurrentPath $currentPath `
+        -HermesBin $hermesBin `
+        -LegacyBin $legacyBin `
+        -RemoveLegacy (-not $NoVenv)
+
+    if ($pathUpdate.Path -ne $currentPath) {
+        [Environment]::SetEnvironmentVariable("Path", $pathUpdate.Path, "User")
+    }
+    if ($pathUpdate.RemovedLegacy) {
+        Write-Info "Removed legacy venv\Scripts from user PATH (kept hermes via $hermesBin)"
+    }
+    if ($pathUpdate.AddedHermes) {
         Write-Success "Added to user PATH: $hermesBin"
     } else {
         Write-Info "PATH already configured"

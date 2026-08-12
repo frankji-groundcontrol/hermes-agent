@@ -47,6 +47,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -378,8 +379,14 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+    basetemp = tempfile.TemporaryDirectory(prefix="hermes-pytest-")
+    options_end = pytest_args.index("--") if "--" in pytest_args else len(pytest_args)
+    cmd = [
+        sys.executable, "-m", "pytest", str(file),
+        *pytest_args[:options_end], f"--basetemp={basetemp.name}",
+        *pytest_args[options_end:],
+    ]
+
     subproc_start = time.monotonic()
     # launch the pytest process
     proc = subprocess.Popen(
@@ -443,6 +450,7 @@ def _run_one_file_once(
         rc = 0
     summary = _parse_pytest_summary(output)
     subproc_wall = time.monotonic() - subproc_start
+    basetemp.cleanup()
     return file, rc, output, summary, subproc_wall
 
 

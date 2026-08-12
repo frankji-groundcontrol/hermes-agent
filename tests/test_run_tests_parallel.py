@@ -252,12 +252,14 @@ def _make_probe_dir(tmp_path: Path) -> Path:
     return probe_dir
 
 
-def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
+def _run_runner(
+    probe_dir: Path, *extra: str, jobs: int = 1
+) -> subprocess.CompletedProcess:
     repo_root = Path(__file__).resolve().parent.parent
     runner = repo_root / "scripts" / "run_tests_parallel.py"
     return subprocess.run(
         [sys.executable, str(runner), "--paths", str(probe_dir),
-         "-j", "1", "--file-timeout", "30", *extra],
+         "-j", str(jobs), "--file-timeout", "30", *extra],
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -268,6 +270,40 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
         errors="replace",
         timeout=60,
     )
+
+
+def test_parallel_pytest_processes_get_private_basetemps(tmp_path: Path) -> None:
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    handoffs = [tmp_path / f"basetemp-{index}.txt" for index in range(2)]
+    ready = [tmp_path / f"ready-{index}" for index in range(2)]
+    for index, handoff in enumerate(handoffs):
+        (probe_dir / f"test_basetemp_{index}.py").write_text(
+            "import time\n"
+            "from pathlib import Path\n\n"
+            "def test_records_basetemp(tmp_path):\n"
+            f"    Path({str(ready[index])!r}).touch()\n"
+            "    deadline = time.monotonic() + 10\n"
+            f"    peers = {[str(path) for path in ready]!r}\n"
+            "    while not all(Path(path).exists() for path in peers):\n"
+            "        assert time.monotonic() < deadline\n"
+            "        time.sleep(0.01)\n"
+            f"    Path({str(handoff)!r}).write_text(str(tmp_path.parent))\n",
+            encoding="utf-8",
+        )
+
+    caller_basetemp = tmp_path / "caller-basetemp"
+    proc = _run_runner(
+        probe_dir, "--file-retries", "0", "--",
+        f"--basetemp={caller_basetemp}", "--", jobs=2
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    roots = [Path(path.read_text()) for path in handoffs]
+    assert roots[0] != roots[1]
+    assert caller_basetemp not in roots
+    assert all(path.name.startswith("hermes-pytest-") for path in roots)
+    assert all(not path.exists() for path in roots)
 
 
 

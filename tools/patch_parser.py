@@ -301,6 +301,12 @@ def _validate_operations(
                     # Models occasionally emit inert anchor hunks between real
                     # changes. Ignore them without poisoning the atomic patch.
                     continue
+                replace_lines = [l.content for l in hunk.lines if l.prefix in {' ', '+'}]
+                if search_lines == replace_lines:
+                    # Degenerate hunk whose -/+ lines are identical: the apply
+                    # phase skips it as a no-op, so validation must not fail it
+                    # or count it as a real change.
+                    continue
                 real_change_count += 1
                 if not search_lines:
                     # Addition-only hunk: validate context hint uniqueness
@@ -320,7 +326,6 @@ def _validate_operations(
                     continue
 
                 search_pattern = '\n'.join(search_lines)
-                replace_lines = [l.content for l in hunk.lines if l.prefix in {' ', '+'}]
                 replacement = '\n'.join(replace_lines)
 
                 new_simulated, count, _strategy, match_error = fuzzy_find_and_replace(
