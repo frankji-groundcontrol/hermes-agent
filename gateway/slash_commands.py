@@ -2636,10 +2636,16 @@ class GatewaySlashCommandsMixin:
             if state is None:
                 return t("gateway.goal.no_goal_set")
             try:
-                adapter = self.adapters.get(event.source.platform) if event.source else None
+                adapter = self._adapter_for_source(event.source) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if adapter and _quick_key:
-                    self._clear_goal_pending_continuations(_quick_key, adapter)
+                    self._clear_goal_pending_continuations(
+                        _quick_key,
+                        adapter,
+                        adapter_session_key=self._adapter_session_key_for_source(
+                            event.source, _quick_key
+                        ),
+                    )
             except Exception as exc:
                 logger.debug("goal pause: pending continuation cleanup failed: %s", exc)
             return t("gateway.goal.paused", goal=state.goal)
@@ -2654,10 +2660,16 @@ class GatewaySlashCommandsMixin:
             had = mgr.has_goal()
             mgr.clear()
             try:
-                adapter = self.adapters.get(event.source.platform) if event.source else None
+                adapter = self._adapter_for_source(event.source) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if adapter and _quick_key:
-                    self._clear_goal_pending_continuations(_quick_key, adapter)
+                    self._clear_goal_pending_continuations(
+                        _quick_key,
+                        adapter,
+                        adapter_session_key=self._adapter_session_key_for_source(
+                            event.source, _quick_key
+                        ),
+                    )
             except Exception as exc:
                 logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
             return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
@@ -2755,7 +2767,7 @@ class GatewaySlashCommandsMixin:
 
         # Queue the goal text as an immediate first turn so the agent
         # starts making progress. The post-turn hook takes over after.
-        adapter = self.adapters.get(event.source.platform) if event.source else None
+        adapter = self._adapter_for_source(event.source) if event.source else None
         _quick_key = self._session_key_for_source(event.source) if event.source else None
         if adapter and _quick_key:
             try:

@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
+_ROUTING_MOVED_FROM = "_routing_moved_from"
+
 
 def _now() -> datetime:
     """Return the current local time."""
@@ -176,6 +178,10 @@ class SessionSource:
     guild_id: Optional[str] = None  # @deprecated legacy alias for scope_id (D-Q2.5)
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    # Feishu top-level mention -> topic bootstrap. Kept separate from
+    # ``thread_id`` because this is an ``om_*`` message ID, not an ``omt_*`` topic ID.
+    reply_thread_anchor_id: Optional[str] = None
+    reply_thread_strict: bool = False
     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
     # Profile this inbound message is routed to in a multiplexing gateway
     # (from the /p/<profile>/ URL prefix or per-credential adapter ownership).
@@ -277,6 +283,10 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        if self.reply_thread_anchor_id:
+            d["reply_thread_anchor_id"] = self.reply_thread_anchor_id
+        if self.reply_thread_strict:
+            d["reply_thread_strict"] = True
         if self.profile:
             d["profile"] = self.profile
         if self.auto_thread_created:
@@ -305,6 +315,8 @@ class SessionSource:
             scope_id=data.get("scope_id", data.get("guild_id")),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            reply_thread_anchor_id=data.get("reply_thread_anchor_id"),
+            reply_thread_strict=bool(data.get("reply_thread_strict", False)),
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
@@ -1062,7 +1074,7 @@ def is_shared_multi_user_session(
     """
     if source.chat_type == "dm":
         return False
-    if source.thread_id:
+    if source.thread_id or source.reply_thread_anchor_id:
         return not thread_sessions_per_user
     return not group_sessions_per_user
 
@@ -1185,7 +1197,15 @@ def build_session_key(
     # when keying on a prospective id so the two byte-match. (Real-thread events
     # already carry chat_type="thread", so this only rewrites the initiating
     # channel message's slot.)
-    effective_thread_id = source.thread_id or source.prospective_thread_id
+    effective_thread_id = (
+        source.thread_id
+        or source.prospective_thread_id
+        or (
+            f"feishu-auto-{source.reply_thread_anchor_id}"
+            if source.reply_thread_anchor_id
+            else None
+        )
+    )
     chat_type_slot = source.chat_type
     if source.prospective_thread_id and not source.thread_id:
         chat_type_slot = "thread"
@@ -1198,9 +1218,9 @@ def build_session_key(
     if effective_thread_id:
         key_parts.append(effective_thread_id)
 
-    # In threads, default to shared sessions (all participants see the same
-    # conversation).  Per-user isolation only applies when explicitly enabled
-    # via thread_sessions_per_user, or when there is no thread (regular group).
+    # In threads (including a provisional Feishu auto-thread lane), default to
+    # shared sessions. The provisional lane is later aliased to the canonical
+    # ``omt_*`` topic key without ending the first turn's session.
     isolate_user = group_sessions_per_user
     if effective_thread_id and not thread_sessions_per_user:
         isolate_user = False
@@ -1248,6 +1268,7 @@ class SessionStore:
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
+        self._session_key_redirects: Dict[str, str] = {}
         self._loaded = False
         self._lock = threading.Lock()
         # Serialize whole-index persistence without holding ``_lock`` across
@@ -1416,6 +1437,20 @@ class SessionStore:
 
         self._loaded = True
 
+        # A structural route move writes state.db and the legacy JSON mirror.
+        # If only one leg succeeds, startup briefly sees both keys.  The
+        # canonical entry carries an explicit tombstone so we can remove only
+        # the route that was actually moved, without collapsing legitimate
+        # same-session aliases created by /resume or peer routing.
+        if self._reconcile_moved_routes_locked():
+            try:
+                self._save()
+            except Exception as exc:
+                logger.warning(
+                    "gateway.session: moved-route reconciliation save failed: %s",
+                    exc,
+                )
+
         # Prune any sessions.json entries that point to sessions already ended
         # in state.db. A hard gateway crash (exit code 1) skips the graceful
         # shutdown path, so sessions.json is never cleared and is left pointing
@@ -1426,6 +1461,35 @@ class SessionStore:
         # entries before the first message arrives. Pruning here (lock already
         # held) is cheap: one lookup per routing key, once at startup.
         self._prune_stale_sessions_locked()
+
+    @staticmethod
+    def _preserved_routing_metadata(entry: Optional[SessionEntry]) -> Dict[str, Any]:
+        if entry is None:
+            return {}
+        moved_from = getattr(entry, "metadata", {}).get(_ROUTING_MOVED_FROM)
+        return (
+            {_ROUTING_MOVED_FROM: dict(moved_from)}
+            if isinstance(moved_from, dict)
+            else {}
+        )
+
+    def _reconcile_moved_routes_locked(self) -> bool:
+        """Drop stale route keys named by a canonical entry's tombstone."""
+        changed = False
+        for canonical_key, canonical in list(self._entries.items()):
+            moved_from = getattr(canonical, "metadata", {}).get(
+                _ROUTING_MOVED_FROM, {}
+            )
+            if not isinstance(moved_from, dict):
+                continue
+            for stale_key, stale_session_id in moved_from.items():
+                if not isinstance(stale_key, str) or stale_key == canonical_key:
+                    continue
+                stale = self._entries.get(stale_key)
+                if stale is not None and stale.session_id == stale_session_id:
+                    self._entries.pop(stale_key, None)
+                    changed = True
+        return changed
 
     def _prune_stale_sessions_locked(self) -> None:
         """Remove sessions.json entries whose session has ended in state.db.
@@ -1480,6 +1544,9 @@ class SessionStore:
                     # queued/resume-pending work disappears until the user sends a
                     # fresh message.
                     if recovered_entry is not None and recovered_entry.session_id != entry.session_id:
+                        recovered_entry.metadata.update(
+                            self._preserved_routing_metadata(entry)
+                        )
                         logger.warning(
                             "gateway.session: repointing stale sessions.json entry "
                             "%r from ended %s (end_reason=%r) to recovered %s",
@@ -1827,6 +1894,16 @@ class SessionStore:
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
             profile=self._resolve_profile_for_key(source),
         )
+
+    def _resolve_session_key_locked(self, session_key: str) -> str:
+        """Follow a live in-process routing-key move."""
+        return getattr(self, "_session_key_redirects", {}).get(
+            session_key, session_key
+        )
+
+    def _resolve_session_key(self, session_key: str) -> str:
+        with self._lock:
+            return self._resolve_session_key_locked(session_key)
 
     def _legacy_slack_session_key(self, source: SessionSource) -> Optional[str]:
         """Return the pre-workspace Slack key for an explicitly scoped source.
@@ -2323,7 +2400,7 @@ class SessionStore:
         
         Sessions with active background processes are never reset.
         """
-        session_key = self._generate_session_key(source)
+        session_key = entry.session_key or self._generate_session_key(source)
         if self._has_active_processes_safe(session_key, context="reset"):
             logger.debug(
                 "Session reset skipped for %s — active background processes",
@@ -2436,7 +2513,9 @@ class SessionStore:
         same key share the owner's result, including concurrent ``force_new``
         deliveries, so only one routing transition and SQLite row is created.
         """
-        session_key = self._generate_session_key(source)
+        session_key = self._resolve_session_key(
+            self._generate_session_key(source)
+        )
         inflight_lock = getattr(self, "_inflight_lock", None)
         if inflight_lock is None:
             inflight_lock = threading.Lock()
@@ -2460,7 +2539,9 @@ class SessionStore:
             return slot.result
 
         try:
-            result = self._get_or_create_session_impl(source, force_new=force_new)
+            result = self._get_or_create_session_impl(
+                source, force_new=force_new, session_key=session_key
+            )
             slot.result = result
             return result
         except BaseException as exc:
@@ -2475,6 +2556,7 @@ class SessionStore:
         self,
         source: SessionSource,
         force_new: bool = False,
+        session_key: Optional[str] = None,
     ) -> SessionEntry:
         """Perform one session routing transition for the single-flight owner.
 
@@ -2482,7 +2564,9 @@ class SessionStore:
         recovery DB queries) is performed *outside* ``self._lock``. The lock
         protects only ``_entries`` / ``_loaded`` mutations.
         """
-        session_key = self._generate_session_key(source)
+        session_key = self._resolve_session_key(
+            session_key or self._generate_session_key(source)
+        )
         now = _now()
 
         # One-time routing-index migration for Slack sessions created before
@@ -2540,6 +2624,7 @@ class SessionStore:
         if not force_new:
             with self._lock:
                 self._ensure_loaded_locked()
+                session_key = self._resolve_session_key_locked(session_key)
                 entry = self._entries.get(session_key)
                 if entry is not None:
                     existing_session_id = entry.session_id
@@ -2556,6 +2641,7 @@ class SessionStore:
         _entry_for_checks = None
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             if force_new:
                 force_new_observed_entry = self._entries.get(session_key)
             if session_key in self._entries and not force_new:
@@ -2609,6 +2695,7 @@ class SessionStore:
 
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
 
             if session_key in self._entries and not force_new:
                 entry = self._entries[session_key]
@@ -2681,6 +2768,9 @@ class SessionStore:
                 session_key=session_key, source=source, now=now,
             )
             if recovered is not None:
+                recovered.metadata.update(
+                    self._preserved_routing_metadata(_entry_for_checks)
+                )
                 recovered_reset_reason = self._should_reset(recovered, source)
                 if recovered_reset_reason:
                     was_auto_reset = True
@@ -2698,8 +2788,12 @@ class SessionStore:
                             exc,
                         )
                     with self._lock:
+                        session_key = self._resolve_session_key_locked(
+                            session_key
+                        )
                         published = self._entries.get(session_key)
                         if published is None:
+                            recovered.session_key = session_key
                             self._entries[session_key] = recovered
                             published = recovered
                     entry = published
@@ -2722,8 +2816,13 @@ class SessionStore:
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
                 prev_session_id=prev_session_id,
+                metadata=self._preserved_routing_metadata(
+                    force_new_observed_entry or _entry_for_checks
+                ),
             )
             with self._lock:
+                session_key = self._resolve_session_key_locked(session_key)
+                candidate.session_key = session_key
                 current = self._entries.get(session_key)
                 may_publish = current is None or (
                     force_new and current is force_new_observed_entry
@@ -2823,6 +2922,7 @@ class SessionStore:
         """Update lightweight session metadata after an interaction."""
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             entry = self._entries.get(session_key)
             if entry is None:
                 return
@@ -2855,6 +2955,7 @@ class SessionStore:
         """Return a metadata value stored on a live session entry."""
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             entry = self._entries.get(session_key)
             if entry is None:
                 return default
@@ -2874,6 +2975,7 @@ class SessionStore:
         """
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             entry = self._entries.get(session_key)
             if entry is None:
                 return False
@@ -2895,6 +2997,7 @@ class SessionStore:
         """
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             entry = self._entries.get(session_key)
             if entry is None:
                 return
@@ -2908,6 +3011,7 @@ class SessionStore:
         """Return the persisted /model override for *session_key*, if any."""
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             entry = self._entries.get(session_key)
             if entry is None:
                 return None
@@ -2922,6 +3026,7 @@ class SessionStore:
         """
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             if session_key in self._entries:
                 self._entries[session_key].suspended = True
                 self._save()
@@ -2938,6 +3043,7 @@ class SessionStore:
         token = uuid.uuid4().hex
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             entry = self._entries.get(session_key)
             if entry is None:
                 return None
@@ -2969,6 +3075,8 @@ class SessionStore:
         """
         with self._lock:
             self._ensure_loaded_locked()
+            original_key = session_key
+            session_key = self._resolve_session_key_locked(session_key)
             entry = self._entries.get(session_key)
             if entry is None or entry.active_turn_token != token:
                 return False
@@ -2985,6 +3093,7 @@ class SessionStore:
             )
             entry.active_turn_token = None
             entry.active_turn_started_at = None
+            getattr(self, "_session_key_redirects", {}).pop(original_key, None)
         return True
 
     def recover_interrupted_turns(
@@ -3080,6 +3189,7 @@ class SessionStore:
         """
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             if session_key in self._entries:
                 entry = self._entries[session_key]
                 # Never override an explicit ``suspended`` — that is a hard
@@ -3104,6 +3214,7 @@ class SessionStore:
         """
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             entry = self._entries.get(session_key)
             if entry is None or not entry.resume_pending:
                 return False
@@ -3207,6 +3318,7 @@ class SessionStore:
 
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
 
             if session_key not in self._entries:
                 return None
@@ -3226,6 +3338,7 @@ class SessionStore:
                 display_name=display_name if display_name is not None else old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                metadata=self._preserved_routing_metadata(old_entry),
                 is_fresh_reset=True,
             )
 
@@ -3311,6 +3424,7 @@ class SessionStore:
 
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             entry = self._entries.get(session_key)
             if entry is None:
                 return None
@@ -3328,6 +3442,53 @@ class SessionStore:
             self._save()
             return entry
 
+    def bind_session_alias(
+        self,
+        alias_source: SessionSource,
+        target_source: SessionSource,
+    ) -> Optional[SessionEntry]:
+        """Move an active provisional route to its canonical routing key."""
+        alias_key = self._generate_session_key(alias_source)
+        target_key = self._generate_session_key(target_source)
+        if not alias_key or not target_key or alias_key == target_key:
+            return None
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            target = self._entries.get(target_key)
+            if target is None:
+                return None
+            existing = self._entries.get(alias_key)
+            if existing is not None:
+                return existing if existing.session_id == target.session_id else None
+
+            self._entries.pop(target_key)
+            target.session_key = alias_key
+            target.updated_at = _now()
+            target.origin = alias_source
+            target.platform = alias_source.platform
+            target.chat_type = alias_source.chat_type
+            moved_from = target.metadata.setdefault(_ROUTING_MOVED_FROM, {})
+            if not isinstance(moved_from, dict):
+                moved_from = {}
+                target.metadata[_ROUTING_MOVED_FROM] = moved_from
+            moved_from[target_key] = target.session_id
+            self._entries[alias_key] = target
+            redirects = getattr(self, "_session_key_redirects", None)
+            if redirects is None:
+                redirects = {}
+                self._session_key_redirects = redirects
+            redirects[target_key] = alias_key
+            self._save()
+
+        self._record_gateway_session_peer(
+            target.session_id,
+            alias_key,
+            alias_source,
+            display_name=target.display_name,
+        )
+        return target
+
     def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 
@@ -3342,6 +3503,7 @@ class SessionStore:
 
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
 
             if session_key not in self._entries:
                 return None
@@ -3364,6 +3526,7 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                metadata=self._preserved_routing_metadata(old_entry),
             )
 
             self._entries[session_key] = new_entry
@@ -3436,6 +3599,7 @@ class SessionStore:
             return None
         with self._lock:
             self._ensure_loaded_locked()
+            session_key = self._resolve_session_key_locked(session_key)
             entry = self._entries.get(session_key)
             return getattr(entry, "session_id", None) if entry else None
     

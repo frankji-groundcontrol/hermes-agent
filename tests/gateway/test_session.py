@@ -26,6 +26,18 @@ normalize_whatsapp_identifier = canonical_whatsapp_identifier
 
 
 class TestSessionSourceRoundtrip:
+    def test_feishu_thread_bootstrap_roundtrip(self):
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_chat",
+            chat_type="group",
+            reply_thread_anchor_id="om_top",
+            reply_thread_strict=True,
+        )
+        restored = SessionSource.from_dict(source.to_dict())
+        assert restored.reply_thread_anchor_id == "om_top"
+        assert restored.reply_thread_strict is True
+
     def test_full_roundtrip(self):
         source = SessionSource(
             platform=Platform.TELEGRAM,

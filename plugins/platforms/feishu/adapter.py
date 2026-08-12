@@ -62,7 +62,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -440,6 +440,9 @@ class FeishuAdapterSettings:
     require_mention: bool = True
     allow_all_users: bool = False
     gateway_allow_all_users: bool = False
+    # Opt-in: accepted top-level group @mentions bootstrap a Feishu topic.
+    # Existing topics remain threaded regardless of this setting.
+    reply_in_thread: bool = False
 
 
 @dataclass
@@ -1683,6 +1686,7 @@ class FeishuAdapter(BasePlatformAdapter):
             gateway_allow_all_users=_to_boolean(
                 _get_scoped_secret("GATEWAY_ALLOW_ALL_USERS", "false")
             ),
+            reply_in_thread=_to_boolean(extra.get("reply_in_thread", False)),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1718,6 +1722,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._require_mention = settings.require_mention
         self._allow_all_users = settings.allow_all_users
         self._gateway_allow_all_users = settings.gateway_allow_all_users
+        self._reply_in_thread = settings.reply_in_thread
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -1983,6 +1988,11 @@ class FeishuAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        route_metadata = metadata
+        if metadata is not None and not isinstance(metadata, dict):
+            route_metadata = dict(metadata)
+        elif isinstance(metadata, dict):
+            route_metadata = metadata
         # When chunking splits a long markdown response, an individual chunk
         # can end up as plain prose that doesn't match the per-chunk hint
         # regex — so it would be sent as ``msg_type=text`` and the user would
@@ -2004,7 +2014,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type=msg_type,
                         payload=payload,
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=route_metadata,
                     )
                 except Exception as exc:
                     if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
@@ -2015,7 +2025,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=route_metadata,
                     )
                 if (
                     msg_type == "post"
@@ -2028,7 +2038,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=route_metadata,
                     )
                 last_response = response
 
@@ -3376,7 +3386,10 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        # Only Feishu's canonical thread_id identifies a topic. root_id and
+        # parent_id describe ordinary reply ancestry too, so treating an ``om_*``
+        # root as a topic creates false thread sessions and reply_in_thread sends.
+        thread_id = getattr(message, "thread_id", None) or None
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)
@@ -3384,6 +3397,15 @@ class FeishuAdapter(BasePlatformAdapter):
             or None
         )
         reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        bootstrap_thread = bool(
+            getattr(self, "_reply_in_thread", False)
+            and chat_type != "p2p"
+            and not is_bot
+            and not thread_id
+            and not reply_to_message_id
+            and message_id
+            and direct_mention
+        )
 
         sender_primary = (
             getattr(sender_id, "open_id", None)
@@ -3415,7 +3437,11 @@ class FeishuAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
+            message_id=message_id,
         )
+        if bootstrap_thread:
+            source.reply_thread_anchor_id = message_id
+            source.reply_thread_strict = True
         normalized = MessageEvent(
             text=text,
             message_type=inbound_type,
@@ -4813,14 +4839,17 @@ class FeishuAdapter(BasePlatformAdapter):
                             metadata=metadata,
                         )
                     if not self._response_succeeded(message_response):
-                        logger.warning("[Feishu] Audio send failed in thread, retrying with chat_id")
-                        message_response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
-                            msg_type=resolved_message_type,
-                            payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
-                            reply_to=None,
-                            metadata=None,
-                        )
+                        if (metadata or {}).get("strict_thread") or (metadata or {}).get("thread_id"):
+                            logger.warning("[Feishu] Audio send failed in strict thread; skipping top-level fallback")
+                        else:
+                            logger.warning("[Feishu] Audio send failed in thread, retrying with chat_id")
+                            message_response = await self._feishu_send_with_retry(
+                                chat_id=chat_id,
+                                msg_type=resolved_message_type,
+                                payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                                reply_to=None,
+                                metadata=None,
+                            )
             return self._finalize_send_result(message_response, "file send failed")
         except Exception as exc:
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
@@ -4857,10 +4886,16 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
-        effective_reply_to = reply_to
-        if not effective_reply_to and metadata and metadata.get("thread_id"):
-            effective_reply_to = metadata.get("reply_to_message_id")
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
+        route = metadata or {}
+        reply_in_thread = bool(route.get("thread_id") or route.get("reply_in_thread"))
+        strict_thread = bool(route.get("strict_thread") or route.get("thread_id"))
+        effective_reply_to = reply_to or (
+            route.get("reply_to_message_id") if reply_in_thread else None
+        )
+        if strict_thread and not effective_reply_to and not route.get("thread_id"):
+            raise RuntimeError(
+                "Feishu thread delivery requires a triggering message anchor"
+            )
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
@@ -5024,6 +5059,73 @@ class FeishuAdapter(BasePlatformAdapter):
             .build()
         )
 
+    def _bind_bootstrap_thread_session(
+        self, metadata: Dict[str, Any], thread_id: str
+    ) -> None:
+        """Publish a created topic and persist it as the bootstrap lane's alias."""
+        from gateway.session import SessionSource
+
+        anchor = str(metadata.get("thread_bootstrap_anchor_id") or "").strip()
+        chat_id = str(metadata.get("thread_bootstrap_chat_id") or "").strip()
+        if not anchor or not chat_id or not thread_id.startswith("omt_"):
+            return
+        bootstrap_source = metadata.get("thread_bootstrap_source")
+        if isinstance(bootstrap_source, SessionSource):
+            provisional_source = replace(bootstrap_source, thread_id=None)
+            topic_source = replace(
+                provisional_source,
+                thread_id=thread_id,
+                reply_thread_anchor_id=None,
+                reply_thread_strict=False,
+            )
+            bootstrap_source.thread_id = thread_id
+        else:
+            provisional_source = SessionSource(
+                platform=Platform.FEISHU,
+                chat_id=chat_id,
+                chat_type="group",
+                reply_thread_anchor_id=anchor,
+                reply_thread_strict=True,
+            )
+            topic_source = SessionSource(
+                platform=Platform.FEISHU,
+                chat_id=chat_id,
+                chat_type="group",
+                thread_id=thread_id,
+            )
+
+        bind_inflight = getattr(self, "_bind_inflight_session_alias", None)
+        if callable(bind_inflight):
+            bind_inflight(topic_source, provisional_source)
+
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return
+        try:
+            store.bind_session_alias(topic_source, provisional_source)
+        except Exception:
+            logger.warning(
+                "[Feishu] Failed to bind created topic to its first-turn session",
+                exc_info=True,
+            )
+
+    def _adopt_bootstrap_route(self, metadata: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(metadata, dict):
+            return
+        bootstrap_source = metadata.get("thread_bootstrap_source")
+        thread_id = str(getattr(bootstrap_source, "thread_id", "") or "").strip()
+        if not thread_id:
+            return
+        metadata.update({
+            "thread_id": thread_id,
+            "reply_in_thread": True,
+            "strict_thread": True,
+        })
+        if not metadata.get("reply_to_message_id"):
+            anchor = getattr(bootstrap_source, "reply_thread_anchor_id", None)
+            if anchor:
+                metadata["reply_to_message_id"] = str(anchor)
+
     async def _feishu_send_with_retry(
         self,
         *,
@@ -5035,62 +5137,101 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Any:
         last_error: Optional[Exception] = None
         active_reply_to = reply_to
-        for attempt in range(_FEISHU_SEND_ATTEMPTS):
+        bootstrap_anchor = str(
+            (metadata or {}).get("thread_bootstrap_anchor_id") or ""
+        ).strip()
+        bootstrap_source = (metadata or {}).get("thread_bootstrap_source")
+        bootstrap_lock = getattr(
+            bootstrap_source, "_feishu_thread_bootstrap_lock", None
+        )
+        if bootstrap_anchor and bootstrap_source is not None and bootstrap_lock is None:
+            bootstrap_lock = asyncio.Lock()
             try:
-                response = await self._send_raw_message(
-                    chat_id=chat_id,
-                    msg_type=msg_type,
-                    payload=payload,
-                    reply_to=active_reply_to,
-                    metadata=metadata,
-                )
-                # If replying to a message failed because it was withdrawn or not found,
-                # fall back to posting a new message directly to the chat.
-                if active_reply_to and not self._response_succeeded(response):
-                    code = getattr(response, "code", None)
-                    if code in _FEISHU_REPLY_FALLBACK_CODES:
-                        if (metadata or {}).get("thread_id"):
+                setattr(bootstrap_source, "_feishu_thread_bootstrap_lock", bootstrap_lock)
+            except Exception:
+                bootstrap_lock = None
+        if bootstrap_lock is not None:
+            await bootstrap_lock.acquire()
+        try:
+            self._adopt_bootstrap_route(metadata)
+            if bootstrap_anchor and isinstance(metadata, dict) and metadata.get("thread_id"):
+                active_reply_to = metadata.get("reply_to_message_id") or active_reply_to
+
+            for attempt in range(_FEISHU_SEND_ATTEMPTS):
+                try:
+                    response = await self._send_raw_message(
+                        chat_id=chat_id,
+                        msg_type=msg_type,
+                        payload=payload,
+                        reply_to=active_reply_to,
+                        metadata=metadata,
+                    )
+                    # An ordinary missing reply target may retain the historical
+                    # flat fallback. Thread-intended sends fail closed instead.
+                    if active_reply_to and not self._response_succeeded(response):
+                        code = getattr(response, "code", None)
+                        if code in _FEISHU_REPLY_FALLBACK_CODES:
+                            if (metadata or {}).get("thread_id") or (metadata or {}).get("strict_thread"):
+                                logger.warning(
+                                    "[Feishu] Strict thread reply failed (code %s — message withdrawn/missing); "
+                                    "skipping top-level fallback",
+                                    code,
+                                )
+                                return response
                             logger.warning(
-                                "[Feishu] Reply to %s failed in thread %s (code %s — message withdrawn/missing); "
-                                "skipping top-level fallback to avoid creating a new topic",
+                                "[Feishu] Reply to %s failed (code %s — message withdrawn/missing); "
+                                "falling back to new message in chat %s",
                                 active_reply_to,
-                                (metadata or {}).get("thread_id"),
                                 code,
+                                chat_id,
                             )
-                            return response
-                        logger.warning(
-                            "[Feishu] Reply to %s failed (code %s — message withdrawn/missing); "
-                            "falling back to new message in chat %s",
-                            active_reply_to,
-                            code,
-                            chat_id,
-                        )
-                        active_reply_to = None
-                        response = await self._send_raw_message(
-                            chat_id=chat_id,
-                            msg_type=msg_type,
-                            payload=payload,
-                            reply_to=None,
-                            metadata=metadata,
-                        )
-                return response
-            except Exception as exc:
-                last_error = exc
-                if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
-                    raise
-                if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
-                    raise
-                wait_seconds = 2 ** attempt
-                logger.warning(
-                    "[Feishu] Send attempt %d/%d failed for chat %s; retrying in %ds: %s",
-                    attempt + 1,
-                    _FEISHU_SEND_ATTEMPTS,
-                    chat_id,
-                    wait_seconds,
-                    exc,
-                )
-                await asyncio.sleep(wait_seconds)
-        raise last_error or RuntimeError("Feishu send failed")
+                            active_reply_to = None
+                            response = await self._send_raw_message(
+                                chat_id=chat_id,
+                                msg_type=msg_type,
+                                payload=payload,
+                                reply_to=None,
+                                metadata=metadata,
+                            )
+
+                    # Publish the canonical topic through the shared inbound
+                    # source so separately-created metadata and replacement
+                    # adapters keep using the same topic.
+                    if self._response_succeeded(response) and isinstance(metadata, dict):
+                        returned_thread_id = self._extract_response_field(response, "thread_id")
+                        returned_message_id = self._extract_response_field(response, "message_id")
+                        if returned_thread_id:
+                            thread_id = str(returned_thread_id)
+                            reply_message_id = str(returned_message_id or active_reply_to or "")
+                            metadata.update({
+                                "thread_id": thread_id,
+                                "reply_in_thread": True,
+                                "strict_thread": True,
+                            })
+                            if reply_message_id:
+                                metadata["reply_to_message_id"] = reply_message_id
+                            self._bind_bootstrap_thread_session(metadata, thread_id)
+                    return response
+                except Exception as exc:
+                    last_error = exc
+                    if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
+                        raise
+                    if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
+                        raise
+                    wait_seconds = 2 ** attempt
+                    logger.warning(
+                        "[Feishu] Send attempt %d/%d failed for chat %s; retrying in %ds: %s",
+                        attempt + 1,
+                        _FEISHU_SEND_ATTEMPTS,
+                        chat_id,
+                        wait_seconds,
+                        exc,
+                    )
+                    await asyncio.sleep(wait_seconds)
+            raise last_error or RuntimeError("Feishu send failed")
+        finally:
+            if bootstrap_lock is not None and bootstrap_lock.locked():
+                bootstrap_lock.release()
 
     async def _release_app_lock(self) -> None:
         if not self._app_lock_identity:

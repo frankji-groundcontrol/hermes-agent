@@ -87,3 +87,23 @@ async def test_active_session_routes_typed_choice_clarify_reply_to_runner_not_bu
     assert adapter._pending_messages == {}
 
 
+@pytest.mark.asyncio
+async def test_profiled_active_session_routes_typed_clarify_reply():
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _ClarifyBypassAdapter()
+    adapter._message_handler = AsyncMock(return_value="")
+    adapter._busy_session_handler = AsyncMock(return_value=True)
+    event = _event("2")
+    adapter_key = build_session_key(event.source)
+    runner_key = f"agent:secondary:{adapter_key.split(':', 2)[2]}"
+    adapter._gateway_profile_name = "secondary"
+    adapter._active_sessions[adapter_key] = asyncio.Event()
+    cm.register("clarify-profile", runner_key, "Pick one", ["A", "B"])
+
+    await adapter.handle_message(event)
+
+    adapter._message_handler.assert_awaited_once_with(event)
+    adapter._busy_session_handler.assert_not_awaited()
+    assert event.source.profile is None

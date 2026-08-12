@@ -5203,16 +5203,17 @@ class TurnRunner:
         # Register the release hook on the adapter so base.py's finally
         # block can fire it after delivering the main response.
         if ctx._status_adapter and ctx.session_key:
+            adapter_session_key = ctx.adapter_session_key or ctx.session_key
             if getattr(type(ctx._status_adapter), "register_post_delivery_callback", None) is not None:
                 ctx._status_adapter.register_post_delivery_callback(
-                    ctx.session_key,
+                    adapter_session_key,
                     _release_bg_review_messages,
                     generation=ctx.run_generation,
                 )
             else:
                 _pdc = getattr(ctx._status_adapter, "_post_delivery_callbacks", None)
                 if _pdc is not None:
-                    _pdc[ctx.session_key] = _release_bg_review_messages
+                    _pdc[adapter_session_key] = _release_bg_review_messages
         # Memory update notifications in chat.  Config: display.memory_notifications
         #   off     — no chat notification (still logged to stdout)
         #   on      — generic "💾 Memory updated" (default)
@@ -6878,6 +6879,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 session_key = self.session_store._generate_session_key(source)
                 if isinstance(session_key, str) and session_key:
+                    adapter_key = self._adapter_session_key_for_source(source, "")
+                    if adapter_key.startswith("agent:main:"):
+                        return f"{session_key.split(':', 2)[0]}:{session_key.split(':', 2)[1]}:{adapter_key.split(':', 2)[2]}"
                     return session_key
             except Exception:
                 pass
@@ -6901,6 +6905,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile,
         )
+
+    @staticmethod
+    def _adapter_session_key_for_source(source: SessionSource, fallback: str) -> str:
+        value = getattr(source, "__dict__", {}).get("_gateway_adapter_session_key")
+        return value if isinstance(value, str) and value else fallback
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -8042,18 +8051,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pending_slot = getattr(adapter, "_pending_messages", None)
         if pending_slot is None:
             return
-        if session_key in pending_slot:
+        adapter_session_key = self._adapter_session_key_for_source(
+            queued_event.source, session_key
+        )
+        if adapter_session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(
                 queued_event
             )
         else:
-            pending_slot[session_key] = queued_event
+            pending_slot[adapter_session_key] = queued_event
 
     def _promote_queued_event(
         self,
         session_key: str,
         adapter: Any,
         pending_event: Optional["MessageEvent"],
+        *,
+        adapter_session_key: Optional[str] = None,
     ) -> Optional["MessageEvent"]:
         """Promote the next overflow item after the slot was drained.
 
@@ -8074,17 +8088,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if pending_event is None:
             return next_queued
         if adapter is not None and hasattr(adapter, "_pending_messages"):
-            adapter._pending_messages[session_key] = next_queued
+            adapter._pending_messages[adapter_session_key or session_key] = next_queued
         else:
             # No adapter — push back so we don't silently drop the item.
             overflow.insert(0, next_queued)
         return pending_event
 
-    def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
+    def _queue_depth(
+        self,
+        session_key: str,
+        *,
+        adapter: Any = None,
+        adapter_session_key: Optional[str] = None,
+    ) -> int:
         """Total pending /queue items for a session — slot + overflow."""
         _q_state = self._peek_session_state(session_key)
         depth = len(_q_state.conversation.queued_events) if _q_state else 0
-        if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
+        if adapter is not None and (adapter_session_key or session_key) in getattr(
+            adapter, "_pending_messages", {}
+        ):
             depth += 1
         return depth
 
@@ -8099,7 +8121,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text = getattr(event_or_text, "text", event_or_text) or ""
         return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
-    def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
+    def _clear_goal_pending_continuations(
+        self,
+        session_key: str,
+        adapter: Any,
+        *,
+        adapter_session_key: Optional[str] = None,
+    ) -> int:
         """Remove queued synthetic /goal continuations for one session.
 
         User-issued /goal pause/clear can race with a continuation already
@@ -8108,10 +8136,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         removed = 0
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        pending_key = adapter_session_key or session_key
         if isinstance(pending_slot, dict):
-            pending_event = pending_slot.get(session_key)
+            pending_event = pending_slot.get(pending_key)
             if self._is_goal_continuation_event(pending_event):
-                pending_slot.pop(session_key, None)
+                pending_slot.pop(pending_key, None)
                 removed += 1
 
         _q_state = self._peek_session_state(session_key)
@@ -9071,6 +9100,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # noqa: SLF001 — intentional private access; runs off the event loop.
         with session_store._lock:  # noqa: SLF001
             session_store._ensure_loaded_locked()  # noqa: SLF001
+            resolver = getattr(type(session_store), "_resolve_session_key_locked", None)
+            if callable(resolver):
+                session_key = resolver(session_store, session_key)
             entry = session_store._entries.get(session_key)  # noqa: SLF001
         return getattr(entry, "session_id", None) if entry is not None else None
 
@@ -9086,6 +9118,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return
+        adapter_session_key = self._adapter_session_key_for_source(
+            event.source, session_key
+        )
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -9095,7 +9130,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the head slot via ``merge_pending_message_event`` (album
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
-        existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        existing = pending_slot.get(adapter_session_key) if isinstance(pending_slot, dict) else None
         if existing is not None and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
@@ -9105,13 +9140,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Preserve photo-burst / media-merge semantics for the head slot.
             merge_pending_message_event(
                 adapter._pending_messages,
-                session_key,
+                adapter_session_key,
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
             return
 
-        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+        _q_state = self._peek_session_state(session_key)
+        queue_depth = len(_q_state.conversation.queued_events) if _q_state else 0
+        queue_depth += int(adapter_session_key in getattr(adapter, "_pending_messages", {}))
+        if queue_depth >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key,
@@ -9119,7 +9157,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
-        self._enqueue_fifo(session_key, event, adapter)
+        if adapter_session_key in adapter._pending_messages:
+            self._session_state(session_key).conversation.queued_events.append(event)
+        else:
+            adapter._pending_messages[adapter_session_key] = event
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -9159,6 +9200,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return (enriched_text or text).strip()
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        session_key = self._session_key_for_source(event.source)
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -10642,7 +10684,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
-            task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
+            adapter_session_key = self._adapter_session_key_for_source(
+                event.source, session_key
+            )
+            task = (
+                session_tasks.get(adapter_session_key)
+                if isinstance(session_tasks, dict)
+                else None
+            )
             if task is not None:
                 await asyncio.shield(task)
         finally:
@@ -13887,6 +13936,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        adapter._gateway_profile_name = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -14112,9 +14162,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event.source.profile = profile_name
             except Exception:
                 pass
-            routed_session_key = self._session_key_for_source(event.source)
             return await self._handle_active_session_busy_message(
-                event, routed_session_key
+                event, _session_key
             )
 
         return _handler
@@ -14808,7 +14857,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timestamp=event.timestamp,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
-        depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
+        depth = self._queue_depth(
+            quick_key,
+            adapter=self._adapter_for_source(source),
+            adapter_session_key=self._adapter_session_key_for_source(
+                source, quick_key
+            ),
+        )
         if depth <= 1:
             return "Queued for the next turn."
         return f"Queued for the next turn. ({depth} queued)"
@@ -15450,7 +15505,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    merge_pending_message_event(
+                        adapter._pending_messages,
+                        self._adapter_session_key_for_source(source, _quick_key),
+                        event,
+                    )
                 return None
 
             effective_busy_input_mode = self._effective_busy_input_mode(source)
@@ -15478,7 +15537,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         merge_pending_message_event(
                             adapter._pending_messages,
-                            _quick_key,
+                            self._adapter_session_key_for_source(source, _quick_key),
                             event,
                             merge_text=True,
                         )
@@ -15499,7 +15558,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if adapter:
                     merge_pending_message_event(
                         adapter._pending_messages,
-                        _quick_key,
+                        self._adapter_session_key_for_source(source, _quick_key),
                         event,
                         merge_text=True,
                     )
@@ -18289,7 +18348,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # same run that registered them.
         self._bind_adapter_run_generation(
             self._adapter_for_source(source),
-            session_key,
+            self._adapter_session_key_for_source(source, session_key),
             run_generation,
         )
 
@@ -18357,13 +18416,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_generation,
                 )
                 _stale_adapter = self._adapter_for_source(source)
+                _stale_adapter_key = self._adapter_session_key_for_source(
+                    source, _quick_key
+                )
                 if getattr(type(_stale_adapter), "pop_post_delivery_callback", None) is not None:
                     _stale_adapter.pop_post_delivery_callback(
-                        _quick_key,
+                        _stale_adapter_key,
                         generation=run_generation,
                     )
                 elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
-                    _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
+                    _stale_adapter._post_delivery_callbacks.pop(_stale_adapter_key, None)
                 return None
 
             response = agent_result.get("final_response") or ""
@@ -18897,9 +18959,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _already_sent = bool(agent_result.get("already_sent"))
             # Skip when streaming TTS already delivered audio for this turn (#60671).
             _stts_adapter = self._adapter_for_source(source)
+            _stts_adapter_key = self._adapter_session_key_for_source(
+                source, session_key
+            )
             _streaming_tts_done = (
                 _stts_adapter is not None
-                and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
+                and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(_stts_adapter_key, run_generation))
             )
             if (
                 not _streaming_tts_done
@@ -19631,17 +19696,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             session_key = self._session_key_for_source(source)
+            adapter_session_key = self._adapter_session_key_for_source(
+                source, session_key
+            )
         except Exception:
             session_key = None
+            adapter_session_key = None
 
         if session_key and hasattr(adapter, "register_post_delivery_callback"):
             try:
                 generation = None
-                active = getattr(adapter, "_active_sessions", {}).get(session_key)
+                active = getattr(adapter, "_active_sessions", {}).get(adapter_session_key)
                 if active is not None:
                     generation = getattr(active, "_hermes_run_generation", None)
                 adapter.register_post_delivery_callback(
-                    session_key,
+                    adapter_session_key,
                     _deliver,
                     generation=generation,
                 )
@@ -21546,6 +21615,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
         )
+        bootstrap_anchor = getattr(source, "reply_thread_anchor_id", None)
+        if bootstrap_anchor:
+            metadata = dict(metadata or {})
+            metadata.update({
+                "reply_to_message_id": str(bootstrap_anchor),
+                "thread_bootstrap_anchor_id": str(bootstrap_anchor),
+                "thread_bootstrap_chat_id": str(getattr(source, "chat_id", "") or ""),
+                "thread_bootstrap_source": source,
+                "reply_in_thread": True,
+                "strict_thread": bool(getattr(source, "reply_thread_strict", False)),
+            })
         if getattr(source, "platform", None) == Platform.SLACK:
             team_id = getattr(source, "scope_id", None)
             if team_id:
@@ -24044,6 +24124,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 daemon=True,
             ).start()
         adapter = self._adapter_for_source(source)
+        adapter_session_key = self._adapter_session_key_for_source(
+            source, session_key
+        )
         interrupt_session_activity = getattr(
             type(adapter), "interrupt_session_activity", None
         )
@@ -24059,12 +24142,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 accepts_metadata = False
             if accepts_metadata:
                 await adapter.interrupt_session_activity(
-                    session_key, source.chat_id, metadata=metadata
+                    adapter_session_key, source.chat_id, metadata=metadata
                 )
             else:
-                await adapter.interrupt_session_activity(session_key, source.chat_id)
+                await adapter.interrupt_session_activity(
+                    adapter_session_key, source.chat_id
+                )
         if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+            adapter.get_pending_message(adapter_session_key)  # consume and discard
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
         if release_running_state:
@@ -25450,6 +25535,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from run_agent import AIAgent
         import queue
 
+        adapter_session_key = self._adapter_session_key_for_source(
+            source, session_key or ""
+        )
+
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
                 return True
@@ -25699,6 +25788,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             channel_prompt=channel_prompt,
             session_id=session_id,
             session_key=session_key,
+            adapter_session_key=adapter_session_key,
             run_generation=run_generation,
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
@@ -25772,17 +25862,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not source.thread_id
             else None
         )
-        _progress_metadata = (
-            self._thread_metadata_for_source(source, event_message_id)
-            if _progress_thread_id == source.thread_id
-            else self._thread_metadata_for_target(
+        _source_progress_metadata = self._thread_metadata_for_source(
+            source, event_message_id
+        )
+        _progress_metadata = _source_progress_metadata or (
+            self._thread_metadata_for_target(
                 source.platform,
                 source.chat_id,
                 _progress_thread_id,
                 chat_type=getattr(source, "chat_type", None),
                 reply_to_message_id=event_message_id,
-            )
-        ) if _progress_thread_id else None
+            ) if _progress_thread_id else None
+        )
         if _progress_metadata is None and _relay_prospective_thread_id:
             # No real thread yet, but the connector will auto-thread on the
             # reply anchor; carry it so progress joins that thread.
@@ -25792,7 +25883,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             event_message_id
             if (
                 source.platform in (Platform.FEISHU, Platform.MATTERMOST)
-                and source.thread_id
+                and (source.thread_id or getattr(source, "reply_thread_anchor_id", None))
                 and event_message_id
             )
             or _relay_prospective_thread_id
@@ -25904,6 +25995,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_id": _progress_thread_id,
                 "reply_to_message_id": event_message_id,
             }
+        elif (
+            source.platform == Platform.FEISHU
+            and getattr(source, "reply_thread_anchor_id", None)
+        ):
+            _status_thread_metadata = _source_progress_metadata
         else:
             _status_thread_metadata = (
                 self._thread_metadata_for_source(source, event_message_id)
@@ -26040,7 +26136,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_detected = asyncio.Event()  # shared with backup check
 
         async def monitor_for_interrupt():
-            if not session_key:
+            if not adapter_session_key:
                 return
 
             while True:
@@ -26051,11 +26147,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _adapter = self._adapter_for_source(source)
                     if not _adapter:
                         continue
-                    # Check if adapter has a pending interrupt for this session.
-                    # Must use session_key (build_session_key output) — NOT
-                    # source.chat_id — because the adapter stores interrupt events
-                    # under the full session key.
-                    if hasattr(_adapter, 'has_pending_interrupt') and _adapter.has_pending_interrupt(session_key):
+                    # The adapter may own a profileless provisional lane while
+                    # the runner uses the profile-qualified session key.
+                    if hasattr(_adapter, 'has_pending_interrupt') and _adapter.has_pending_interrupt(adapter_session_key):
                         agent = agent_holder[0]
                         if agent:
                             # Peek at the pending message text WITHOUT consuming it.
@@ -26066,7 +26160,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # before checking _interrupt_requested, and the message
                             # is lost — neither the interrupt path nor the dequeue
                             # path finds it.
-                            _peek_event = _adapter._pending_messages.get(session_key)
+                            _peek_event = _adapter._pending_messages.get(adapter_session_key)
                             pending_text = None
                             if _peek_event is not None:
                                 pending_text = _peek_event.text or ""
@@ -26349,13 +26443,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         break
                     # Backup interrupt check: if the monitor task died or
                     # missed the interrupt, catch it here.
-                    if not _interrupt_detected.is_set() and session_key:
+                    if not _interrupt_detected.is_set() and adapter_session_key:
                         _backup_adapter = self._adapter_for_source(source)
                         _backup_agent = agent_holder[0]
                         if (_backup_adapter and _backup_agent
                                 and hasattr(_backup_adapter, 'has_pending_interrupt')
-                                and _backup_adapter.has_pending_interrupt(session_key)):
-                            _bp_event = _backup_adapter._pending_messages.get(session_key)
+                                and _backup_adapter.has_pending_interrupt(adapter_session_key)):
+                            _bp_event = _backup_adapter._pending_messages.get(adapter_session_key)
                             _bp_text = _bp_event.text if _bp_event else None
                             if _bp_event is not None:
                                 _bp_media_urls = getattr(_bp_event, "media_urls", None) or []
@@ -26451,13 +26545,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ).start()
                         break
                     # Backup interrupt check (same as unlimited path).
-                    if not _interrupt_detected.is_set() and session_key:
+                    if not _interrupt_detected.is_set() and adapter_session_key:
                         _backup_adapter = self._adapter_for_source(source)
                         _backup_agent = agent_holder[0]
                         if (_backup_adapter and _backup_agent
                                 and hasattr(_backup_adapter, 'has_pending_interrupt')
-                                and _backup_adapter.has_pending_interrupt(session_key)):
-                            _bp_event = _backup_adapter._pending_messages.get(session_key)
+                                and _backup_adapter.has_pending_interrupt(adapter_session_key)):
+                            _bp_event = _backup_adapter._pending_messages.get(adapter_session_key)
                             _bp_text = _bp_event.text if _bp_event else None
                             if _bp_event is not None:
                                 _bp_media_urls = getattr(_bp_event, "media_urls", None) or []
@@ -26613,21 +26707,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _stts.suppress_whole_file and adapter is not None:
                     _mark_turn = getattr(adapter, "_mark_streaming_tts_completed_turn", None)
                     if callable(_mark_turn):
-                        _mark_turn(session_key, run_generation)
+                        _mark_turn(adapter_session_key, run_generation)
             
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
             pending = None
             if result and adapter and session_key:
-                pending_event = _dequeue_pending_event(adapter, session_key)
+                pending_event = _dequeue_pending_event(
+                    adapter, adapter_session_key
+                )
                 # /queue overflow: after consuming the adapter's "next-up"
                 # slot, promote the next queued event into it so the
                 # recursive run's drain will see it.  This keeps the slot
                 # occupied for the full FIFO chain, which (a) preserves
                 # order, and (b) causes any mid-chain /queue to correctly
                 # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                pending_event = self._promote_queued_event(
+                    session_key,
+                    adapter,
+                    pending_event,
+                    adapter_session_key=adapter_session_key,
+                )
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
@@ -26710,8 +26811,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Clear the adapter's interrupt event so the next _run_agent call
                 # doesn't immediately re-trigger the interrupt before the new agent
                 # even makes its first API call (this was causing an infinite loop).
-                if adapter and hasattr(adapter, '_active_sessions') and session_key and session_key in adapter._active_sessions:
-                    adapter._active_sessions[session_key].clear()
+                if adapter and hasattr(adapter, '_active_sessions') and adapter_session_key in adapter._active_sessions:
+                    adapter._active_sessions[adapter_session_key].clear()
 
                 # Cap recursion depth to prevent resource exhaustion when the
                 # user sends multiple messages while the agent keeps failing. (#816)
@@ -26723,9 +26824,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        merge_pending_message_event(
+                            adapter._pending_messages,
+                            adapter_session_key,
+                            pending_event,
+                        )
                     elif adapter and hasattr(adapter, 'queue_message'):
-                        adapter.queue_message(session_key, pending)
+                        adapter.queue_message(adapter_session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
@@ -26802,7 +26907,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # base.py's finally block) and call it.
                     if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
                         _bg_cb = adapter.pop_post_delivery_callback(
-                            session_key,
+                            adapter_session_key,
                             generation=run_generation,
                         )
                         if callable(_bg_cb):
@@ -26813,7 +26918,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             except Exception:
                                 pass
                     elif adapter and hasattr(adapter, "_post_delivery_callbacks"):
-                        _bg_cb = adapter._post_delivery_callbacks.pop(session_key, None)
+                        _bg_cb = adapter._post_delivery_callbacks.pop(
+                            adapter_session_key, None
+                        )
                         if callable(_bg_cb):
                             try:
                                 _bg_result = _bg_cb()
@@ -26877,7 +26984,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _completed_turns is not None:
                         _prior_key = getattr(_clear_adapter, "_streaming_tts_turn_key", None)
                         if callable(_prior_key):
-                            _pk = _prior_key(session_key, run_generation)
+                            _pk = _prior_key(adapter_session_key, run_generation)
                             if _pk:
                                 _completed_turns.discard(_pk)
 
@@ -27177,7 +27284,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 _cleanup_adapter.register_post_delivery_callback(
-                    session_key,
+                    adapter_session_key,
                     _cleanup_temp_bubbles,
                     generation=run_generation,
                 )

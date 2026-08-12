@@ -1190,6 +1190,162 @@ class TestAdapterBehavior(unittest.TestCase):
                 second = FeishuAdapter(PlatformConfig())
                 self.assertTrue(second._is_duplicate("om_same"))
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_top_level_bootstrap_returns_canonical_thread_id(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platforms.base import _thread_metadata_for_source
+        from gateway.session import SessionSource
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _ReplyAPI:
+            def reply(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(
+                        message_id="om_reply",
+                        thread_id="omt_created",
+                    ),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_ReplyAPI()))
+        )
+        adapter._session_store = None
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_chat",
+            chat_type="group",
+            reply_thread_anchor_id="om_top",
+            reply_thread_strict=True,
+        )
+        metadata = _thread_metadata_for_source(source)
+        with patch(
+            "plugins.platforms.feishu.adapter.asyncio.to_thread",
+            side_effect=_direct,
+        ):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="hello",
+                    reply_to="om_top",
+                    metadata=metadata,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertTrue(captured["request"].request_body.reply_in_thread)
+        self.assertEqual(metadata["thread_id"], "omt_created")
+        self.assertEqual(source.thread_id, "omt_created")
+        self.assertEqual(
+            _thread_metadata_for_source(source)["thread_id"], "omt_created"
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_strict_thread_reply_never_falls_back_flat(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        calls = {"reply": 0, "create": 0}
+
+        class _MessageAPI:
+            def reply(self, request):
+                calls["reply"] += 1
+                return SimpleNamespace(
+                    success=lambda: False,
+                    code=230011,
+                    msg="missing",
+                )
+
+            def create(self, request):
+                calls["create"] += 1
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_flat"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch(
+            "plugins.platforms.feishu.adapter.asyncio.to_thread",
+            side_effect=_direct,
+        ):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="hello",
+                    reply_to="om_top",
+                    metadata={
+                        "reply_to_message_id": "om_top",
+                        "reply_in_thread": True,
+                        "strict_thread": True,
+                    },
+                )
+            )
+
+        self.assertFalse(result.success)
+        self.assertEqual(calls, {"reply": 1, "create": 0})
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_strict_thread_audio_never_falls_back_flat(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(file=SimpleNamespace(create=Mock())))
+        )
+        failed = SimpleNamespace(success=lambda: False, code=99992402, msg="unsupported")
+        adapter._run_blocking = AsyncMock(
+            return_value=SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(file_key="file_audio"),
+            )
+        )
+        adapter._feishu_send_with_retry = AsyncMock(side_effect=[failed, failed])
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".ogg", delete=False) as tmp:
+            tmp.write(b"OggS")
+            audio_path = tmp.name
+
+        try:
+            result = asyncio.run(
+                adapter.send_voice(
+                    chat_id="oc_chat",
+                    audio_path=audio_path,
+                    reply_to="om_parent",
+                    metadata={
+                        "thread_id": "omt_thread",
+                        "reply_to_message_id": "om_parent",
+                        "strict_thread": True,
+                    },
+                )
+            )
+        finally:
+            os.unlink(audio_path)
+
+        self.assertFalse(result.success)
+        self.assertEqual(adapter._feishu_send_with_retry.await_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs["metadata"] is not None
+                for call in adapter._feishu_send_with_retry.await_args_list
+            )
+        )
+
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_document_reply_uses_thread_flag(self):
@@ -2225,7 +2381,160 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         adapter._resolve_source_chat_type = Mock(return_value="group")
         adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
         adapter._dispatch_inbound_event = AsyncMock()
+        adapter._reply_in_thread = False
         return adapter
+
+    def test_top_level_group_self_mention_gets_thread_bootstrap_when_enabled(self):
+        adapter = self._build_adapter()
+        adapter._reply_in_thread = True
+        adapter.build_source = Mock(
+            return_value=SimpleNamespace(
+                thread_id=None,
+                reply_thread_anchor_id=None,
+                reply_thread_strict=False,
+            )
+        )
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "@_user_1 hello"}),
+            message_type="text",
+            message_id="om_top",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            root_id=None,
+            thread_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="om_top",
+            )
+        )
+        source = adapter._dispatch_inbound_event.call_args.args[0].source
+        self.assertEqual(source.reply_thread_anchor_id, "om_top")
+        self.assertTrue(source.reply_thread_strict)
+
+    def test_bot_self_mention_does_not_get_thread_bootstrap(self):
+        adapter = self._build_adapter()
+        adapter._reply_in_thread = True
+        adapter.build_source = Mock(
+            return_value=SimpleNamespace(
+                thread_id=None,
+                reply_thread_anchor_id=None,
+                reply_thread_strict=False,
+            )
+        )
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "@_user_1 hello"}),
+            message_type="text",
+            message_id="om_bot",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            root_id=None,
+            thread_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="om_bot",
+                is_bot=True,
+            )
+        )
+        source = adapter._dispatch_inbound_event.call_args.args[0].source
+        self.assertIsNone(source.reply_thread_anchor_id)
+
+    def test_embedded_self_mention_does_not_get_thread_bootstrap(self):
+        adapter = self._build_adapter()
+        adapter._reply_in_thread = True
+        adapter.build_source = Mock(
+            return_value=SimpleNamespace(
+                thread_id=None,
+                reply_thread_anchor_id=None,
+                reply_thread_strict=False,
+            )
+        )
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "please don't @_user_1 anymore"}),
+            message_type="text",
+            message_id="om_embedded",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            root_id=None,
+            thread_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="om_embedded",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertIsNone(event.source.reply_thread_anchor_id)
+        self.assertEqual(event.text, "please don't @Hermes anymore")
+
+    def test_root_id_is_reply_context_not_topic_identity(self):
+        adapter = self._build_adapter()
+        adapter.build_source = Mock(
+            return_value=SimpleNamespace(
+                thread_id=None,
+                reply_thread_anchor_id=None,
+                reply_thread_strict=False,
+            )
+        )
+        adapter._fetch_message_text = AsyncMock(return_value="quoted")
+        message = SimpleNamespace(
+            content=json.dumps({"text": "reply"}),
+            message_type="text",
+            message_id="om_reply",
+            mentions=[],
+            chat_id="oc_chat",
+            parent_id="om_parent",
+            upper_message_id=None,
+            root_id="om_root",
+            thread_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="om_reply",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertIsNone(event.source.thread_id)
+        self.assertEqual(event.reply_to_message_id, "om_parent")
+        self.assertEqual(event.reply_to_text, "quoted")
 
 
     def test_non_command_message_with_mentions_injects_hint(self):
@@ -2523,4 +2832,3 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-

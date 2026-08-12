@@ -199,3 +199,58 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     assert adapter._pending_messages[adapter_key].text.startswith(
         "[Continuing toward your standing goal]"
     )
+
+
+@pytest.mark.asyncio
+async def test_profiled_goal_uses_source_adapter_lane():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._sessions = {}
+    runner_key = "agent:secondary:feishu:group:oc_chat:feishu-auto-om_top"
+    adapter_key = "agent:main:feishu:group:oc_chat:feishu-auto-om_top"
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="group",
+        profile="secondary",
+    )
+    setattr(source, "_gateway_adapter_session_key", adapter_key)
+    event = MessageEvent(
+        text="/goal pause",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    continuation = MessageEvent(
+        text=CONTINUATION_TEXT,
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    adapter = SimpleNamespace(_pending_messages={adapter_key: continuation})
+    default_adapter = SimpleNamespace(_pending_messages={})
+    runner.adapters = {Platform.FEISHU: default_adapter}
+    runner._adapter_for_source = lambda _source: adapter
+    runner._session_key_for_source = lambda _source: runner_key
+    manager = MagicMock()
+    manager.pause.return_value = SimpleNamespace(goal="ship it")
+    runner._get_goal_manager_for_event = AsyncMock(
+        return_value=(manager, MagicMock())
+    )
+
+    await runner._handle_goal_command(event)
+
+    assert adapter._pending_messages == {}
+
+    manager.set.return_value = SimpleNamespace(
+        goal="ship it",
+        max_turns=20,
+        has_contract=lambda: False,
+    )
+    event.text = "/goal ship it"
+    await runner._handle_goal_command(event)
+
+    assert adapter._pending_messages[adapter_key].text == "ship it"
+    assert default_adapter._pending_messages == {}

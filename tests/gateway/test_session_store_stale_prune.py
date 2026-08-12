@@ -237,6 +237,54 @@ class TestStartupRecoveryResetPolicy:
         db.reopen_session.assert_called_once_with("sid_child")
         db.promote_to_session_reset.assert_not_called()
 
+    def test_load_repoints_origin_entry_without_locking_itself(self, tmp_path):
+        key = "agent:main:telegram:dm:5140768830"
+        entry = _make_entry_with_origin(key, "sid_parent")
+        (tmp_path / "sessions.json").write_text(
+            json.dumps({key: entry.to_dict()}), encoding="utf-8"
+        )
+        db = _db_returning(
+            {"sid_parent": {"end_reason": "compression", "id": "sid_parent"}}
+        )
+        db.find_latest_gateway_session_for_peer.return_value = {
+            "id": "sid_child",
+            "started_at": datetime.now().timestamp(),
+            "last_activity_at": datetime.now().timestamp(),
+        }
+        store = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(
+                default_reset_policy=SessionResetPolicy(mode="none")
+            ),
+        )
+        store._db = db
+
+        store._ensure_loaded()
+
+        assert store._entries[key].session_id == "sid_child"
+
+    def test_startup_repoint_preserves_moved_route_tombstone(self, tmp_path):
+        key = "agent:main:telegram:dm:5140768830"
+        entry = _make_entry_with_origin(key, "sid_parent")
+        entry.metadata["_routing_moved_from"] = {"old-key": "sid_parent"}
+        db = _db_returning(
+            {"sid_parent": {"end_reason": "compression", "id": "sid_parent"}}
+        )
+        db.find_latest_gateway_session_for_peer.return_value = {
+            "id": "sid_child",
+            "started_at": datetime.now().timestamp(),
+            "last_activity_at": datetime.now().timestamp(),
+        }
+        store = _make_store_with_db(tmp_path, db)
+        store._entries[key] = entry
+
+        with patch.object(store, "_save"):
+            store._prune_stale_sessions_locked()
+
+        assert store._entries[key].metadata["_routing_moved_from"] == {
+            "old-key": "sid_parent"
+        }
+
 
 # ---------------------------------------------------------------------------
 # Integration: _ensure_loaded_locked calls _prune_stale_sessions_locked
@@ -256,4 +304,3 @@ class TestEnsureLoadedCallsPrune:
         store._ensure_loaded()
 
         assert "dm_key" not in store._entries
-

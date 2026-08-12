@@ -245,6 +245,30 @@ FEISHU_REQUIRE_MENTION=false
 
 For per-chat control, set `require_mention` on a `group_rules` entry — see [Per-Group Access Control](#per-group-access-control) below.
 
+### Start a topic for top-level mentions
+
+By default, a top-level group mention receives an ordinary reply in the main
+chat timeline. To make each accepted top-level direct bot mention start a
+Feishu topic, enable the profile-scoped option:
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      reply_in_thread: true
+```
+
+This option is `false` by default. It applies only to top-level group messages
+that directly mention the bot; it does not auto-thread DMs, `@all` by itself,
+unmentioned traffic, cron delivery, or home-channel delivery. Messages already
+inside a genuine Feishu topic stay in that topic regardless of this option.
+
+Hermes keeps text, progress/status output, cards, and native attachments on the
+same created topic and preserves the conversation session for follow-ups. A
+thread-intended send fails closed when Feishu cannot reply to the triggering
+message or the group does not support topics; Hermes does not silently post the
+answer at the bottom of the main chat.
+
 ### Bot Identity
 
 Hermes auto-detects the bot's `open_id` and display name on startup. You only need to set these manually when auto-detection cannot reach the Feishu API, or when your app uses tenant-scoped user IDs:

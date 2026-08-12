@@ -104,6 +104,19 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     """
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    reply_thread_anchor_id = getattr(source, "reply_thread_anchor_id", None)
+    if reply_thread_anchor_id:
+        metadata.update({
+            "reply_to_message_id": str(reply_thread_anchor_id),
+            "thread_bootstrap_anchor_id": str(reply_thread_anchor_id),
+            "thread_bootstrap_chat_id": str(getattr(source, "chat_id", "") or ""),
+            # This is process-local routing state, never part of the Feishu API
+            # payload. It lets every output path observe the topic created by
+            # the first reply, including after adapter replacement.
+            "thread_bootstrap_source": source,
+            "reply_in_thread": True,
+            "strict_thread": bool(getattr(source, "reply_thread_strict", False)),
+        })
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary
@@ -162,8 +175,12 @@ def _reply_anchor_for_event(event) -> str | None:
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "telegram" and thread_id:
         return None
-    if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
-        return getattr(event, "reply_to_message_id", None)
+    if platform == "feishu":
+        bootstrap_anchor = getattr(source, "reply_thread_anchor_id", None)
+        if bootstrap_anchor:
+            return str(bootstrap_anchor)
+        if thread_id and getattr(event, "reply_to_message_id", None):
+            return getattr(event, "reply_to_message_id", None)
     return getattr(event, "message_id", None)
 
 
@@ -3036,6 +3053,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
+        self._inflight_session_aliases: Dict[str, str] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
         # construction (gateway/run.py). Default to "interrupt" so a stray
@@ -5686,6 +5704,37 @@ class BasePlatformAdapter(ABC):
     # normal completion path, (b) /stop/ /new/ /reset bypass commands,
     # and (c) stale-lock self-heal on the next inbound message.
 
+    def _bind_inflight_session_alias(
+        self,
+        alias_source: SessionSource,
+        target_source: SessionSource,
+    ) -> None:
+        """Route a newly discovered topic key through its active bootstrap lane."""
+        extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+        key_args = {
+            "group_sessions_per_user": extra.get("group_sessions_per_user", True),
+            "thread_sessions_per_user": extra.get("thread_sessions_per_user", False),
+        }
+        alias_key = build_session_key(alias_source, **key_args)
+        target_key = build_session_key(target_source, **key_args)
+        active_sessions = getattr(self, "_active_sessions", {})
+        if alias_key != target_key and target_key in active_sessions:
+            aliases = getattr(self, "_inflight_session_aliases", None)
+            if aliases is None:
+                aliases = {}
+                self._inflight_session_aliases = aliases
+            aliases[alias_key] = target_key
+
+    def _resolve_inflight_session_alias(self, session_key: str) -> str:
+        """Return the live bootstrap key for a just-created topic, if any."""
+        return getattr(self, "_inflight_session_aliases", {}).get(session_key, session_key)
+
+    def _drop_inflight_session_aliases(self, session_key: str) -> None:
+        aliases = getattr(self, "_inflight_session_aliases", {})
+        for alias, target in list(aliases.items()):
+            if target == session_key:
+                aliases.pop(alias, None)
+
     def _release_session_guard(
         self,
         session_key: str,
@@ -5748,6 +5797,7 @@ class BasePlatformAdapter(ABC):
         self._pending_messages.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
+        self._drop_inflight_session_aliases(session_key)
         return True
 
     def _start_session_processing(
@@ -5848,6 +5898,7 @@ class BasePlatformAdapter(ABC):
         pending_event = self._pending_messages.pop(session_key, None)
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is None:
+            self._drop_inflight_session_aliases(session_key)
             return
         self._start_session_processing(pending_event, session_key)
 
@@ -5957,6 +6008,8 @@ class BasePlatformAdapter(ABC):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+        session_key = self._resolve_inflight_session_alias(session_key)
+        setattr(event.source, "_gateway_adapter_session_key", session_key)
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -6045,9 +6098,21 @@ class BasePlatformAdapter(ABC):
             if not cmd:
                 try:
                     from tools import clarify_gateway as _clarify_mod
+                    _clarify_session_key = session_key
+                    _profile = getattr(event.source, "profile", None) or getattr(
+                        self, "_gateway_profile_name", None
+                    )
+                    if (
+                        _profile
+                        and _profile != "default"
+                        and session_key.startswith("agent:main:")
+                    ):
+                        _clarify_session_key = (
+                            f"agent:{_profile}:{session_key.split(':', 2)[2]}"
+                        )
                     _has_text_clarify = (
                         _clarify_mod.get_pending_for_session(
-                            session_key,
+                            _clarify_session_key,
                             include_choice_prompts=True,
                         ) is not None
                     )
@@ -6903,6 +6968,7 @@ class BasePlatformAdapter(ABC):
         self._release_session_guard(session_key, guard=interrupt_event)
         if session_key not in self._active_sessions:
             self._session_tasks.pop(session_key, None)
+            self._drop_inflight_session_aliases(session_key)
     
     async def cancel_background_tasks(self) -> None:
         """Cancel any in-flight background message-processing tasks.
@@ -6960,6 +7026,7 @@ class BasePlatformAdapter(ABC):
             pass
         self._pending_messages.clear()
         self._active_sessions.clear()
+        self._inflight_session_aliases.clear()
         for state in list(self._text_debounce_store().values()):
             if state.task is not None and not state.task.done():
                 state.task.cancel()

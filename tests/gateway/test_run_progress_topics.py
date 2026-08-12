@@ -924,6 +924,8 @@ async def _run_with_agent(
     chat_id="-1001",
     chat_type="group",
     thread_id="17585",
+    reply_thread_anchor_id=None,
+    reply_thread_strict=False,
     adapter_cls=ProgressCaptureAdapter,
 ):
     if config_data:
@@ -951,6 +953,8 @@ async def _run_with_agent(
         chat_id=chat_id,
         chat_type=chat_type,
         thread_id=thread_id,
+        reply_thread_anchor_id=reply_thread_anchor_id,
+        reply_thread_strict=reply_thread_strict,
     )
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
@@ -1024,6 +1028,36 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_feishu_bootstrap_routes_interim_commentary(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-feishu-bootstrap-commentary",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": True,
+            },
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="group",
+        thread_id=None,
+        reply_thread_anchor_id="om_top",
+        reply_thread_strict=True,
+    )
+
+    assert result.get("already_sent") is not True
+    interim = next(
+        call for call in adapter.sent if call["content"] == "I'll inspect the repo first."
+    )
+    assert interim["metadata"]["reply_to_message_id"] == "om_top"
+    assert interim["metadata"]["reply_in_thread"] is True
+    assert interim["metadata"]["strict_thread"] is True
 
 
 class TransformedStreamAgent:
