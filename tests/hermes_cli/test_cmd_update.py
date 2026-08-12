@@ -7,7 +7,17 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_cli.main import cmd_update, PROJECT_ROOT
+from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def _isolate_update_checkout(monkeypatch, tmp_path):
+    from hermes_cli import main as hm
+
+    checkout = tmp_path / "project-root"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", checkout)
 
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
@@ -177,7 +187,7 @@ class TestCmdUpdateTermuxUvBootstrap:
             "--only-binary",
             ":all:",
         ]
-        assert mock_run.call_args.kwargs["cwd"] == PROJECT_ROOT
+        assert mock_run.call_args.kwargs["cwd"] == hm.PROJECT_ROOT
         assert mock_run.call_args.kwargs["check"] is False
 
     @patch("subprocess.run")
@@ -230,7 +240,7 @@ class TestCmdUpdateBranchFallback:
         expected_git_cmd = (
             ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
         )
-        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
+        sync_mock.assert_called_once_with(expected_git_cmd, hm.PROJECT_ROOT)
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
@@ -755,6 +765,12 @@ class TestNodeRuntimeNpmResolution:
         """A Windows-only npm on WSL must not reach web or desktop builds."""
         from hermes_cli import main as hm
         import hermes_constants
+
+        (hm.PROJECT_ROOT / "package.json").write_text("{}")
+        for workspace in ("web", "apps/desktop"):
+            path = hm.PROJECT_ROOT / workspace
+            path.mkdir(parents=True)
+            (path / "package.json").write_text("{}")
 
         windows_npm = "/mnt/c/Program Files/nodejs/npm"
         monkeypatch.setattr(hm, "_is_windows", lambda: False)

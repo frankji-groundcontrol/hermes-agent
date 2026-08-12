@@ -12,7 +12,19 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def _isolate_update_checkout(monkeypatch, tmp_path):
+    from hermes_cli import main as hm
+
+    checkout = tmp_path / "project-root"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", checkout)
 
 
 def _make_run_side_effect(
