@@ -97,6 +97,7 @@ CreateMessageRequest = None  # type: ignore[assignment]
 CreateMessageRequestBody = None  # type: ignore[assignment]
 GetChatRequest = None  # type: ignore[assignment]
 GetMessageRequest = None  # type: ignore[assignment]
+ListMessageRequest = None  # type: ignore[assignment]
 GetMessageResourceRequest = None  # type: ignore[assignment]
 P2ImMessageMessageReadV1 = None  # type: ignore[assignment]
 ReplyMessageRequest = None  # type: ignore[assignment]
@@ -1407,7 +1408,7 @@ def _load_lark_oapi() -> bool:
                 CreateFileRequest, CreateFileRequestBody,
                 CreateImageRequest, CreateImageRequestBody,
                 CreateMessageRequest, CreateMessageRequestBody,
-                GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
+                GetChatRequest, GetMessageRequest, GetMessageResourceRequest, ListMessageRequest,
                 P2ImMessageMessageReadV1,
                 ReplyMessageRequest, ReplyMessageRequestBody,
                 UpdateMessageRequest, UpdateMessageRequestBody,
@@ -1434,6 +1435,7 @@ def _load_lark_oapi() -> bool:
             "CreateMessageRequestBody": CreateMessageRequestBody,
             "GetChatRequest": GetChatRequest,
             "GetMessageRequest": GetMessageRequest,
+            "ListMessageRequest": ListMessageRequest,
             "GetMessageResourceRequest": GetMessageResourceRequest,
             "P2ImMessageMessageReadV1": P2ImMessageMessageReadV1,
             "ReplyMessageRequest": ReplyMessageRequest,
@@ -3397,6 +3399,26 @@ class FeishuAdapter(BasePlatformAdapter):
             or None
         )
         reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        if reply_to_message_id and getattr(message, "chat_type", "p2p") != "p2p":
+            # Group-only: the mentioned reply may quote a media message the
+            # mention policy dropped — pull its resources onto THIS event.
+            rr_urls, rr_types = await self._fetch_reply_media(reply_to_message_id)
+            media_urls = list(media_urls) + rr_urls
+            media_types = list(media_types) + rr_types
+        elif (
+            getattr(message, "chat_type", "p2p") != "p2p"
+            and getattr(self, "_require_mention_for", lambda _cid: True)(
+                getattr(message, "chat_id", "") or "")
+            and not media_urls
+        ):
+            # Group @ with NO reply and no inline media: the user may be
+            # pointing at a file the mention policy dropped on arrival —
+            # look back through recent history and attach the newest media.
+            chat_id_lb = getattr(message, "chat_id", "") or ""
+            lb_urls, lb_types, lb_source = await self._fetch_recent_media(chat_id_lb)
+            if lb_urls:
+                media_urls = list(media_urls) + lb_urls
+                media_types = list(media_types) + lb_types
         bootstrap_thread = bool(
             getattr(self, "_reply_in_thread", False)
             and chat_type != "p2p"
@@ -4330,6 +4352,130 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[Feishu] Failed to fetch bot names for %s", bot_ids, exc_info=True)
             return None
+
+    async def _fetch_recent_media(
+        self, chat_id: str,
+    ) -> tuple[List[str], List[str], Optional[str]]:
+        """Group @-mention with NO reply: look back through the chat's recent
+        history and attach the newest media message.
+
+        Requires the app scope im:message.group_msg (history listing); when
+        absent the API refusal is logged once and the lookback is a no-op —
+        the reply-quote path (_fetch_reply_media) still works without it.
+        Windowed by FEISHU_HISTORY_LOOKBACK_MINUTES (default 120) so a
+        week-old file never latches onto an unrelated mention; the agent
+        sees the attachment's filename and confirms with the user.
+        """
+        if not self._client or not chat_id:
+            return [], [], None
+        try:
+            lookback = int(os.environ.get("FEISHU_HISTORY_LOOKBACK", "20") or 20)
+            window_min = int(os.environ.get("FEISHU_HISTORY_LOOKBACK_MINUTES", "120") or 120)
+        except ValueError:
+            lookback, window_min = 20, 120
+        if lookback <= 0:
+            return [], [], None
+        try:
+            if ListMessageRequest is None:
+                logger.info("[Feishu] History lookback unavailable: lark-oapi too old for ListMessageRequest")
+                return [], [], None
+            request = (
+                ListMessageRequest.builder()
+                .container_id(chat_id)
+                .container_id_type("chat")
+                .sort_type("ByCreateTimeDesc")
+                .page_size(min(50, lookback))
+                .build()
+            )
+            response = await self._run_blocking(self._client.im.v1.message.list, request)
+            if not response or getattr(response, "success", lambda: False)() is False:
+                code = getattr(response, "code", "unknown")
+                logger.info(
+                    "[Feishu] History lookback unavailable for %s (code=%s) — "
+                    "enable im:message.group_msg on the app to use it", chat_id, code,
+                )
+                return [], [], None
+            items = getattr(getattr(response, "data", None), "items", None) or []
+            now_ms = int(datetime.now().timestamp() * 1000)
+            for parent in items:
+                if str(getattr(parent, "deleted", False)).lower() == "true":
+                    continue
+                created = getattr(parent, "create_time", None)
+                try:
+                    created_ms = int(created) if created else 0
+                except (TypeError, ValueError):
+                    created_ms = 0
+                if created_ms and (now_ms - created_ms) > window_min * 60_000:
+                    break  # desc order: everything older is outside the window
+                msg_type = (getattr(parent, "msg_type", "") or "").strip()
+                if msg_type in {"text", "interactive"}:
+                    continue
+                body = getattr(parent, "body", None)
+                raw_content = getattr(body, "content", "") or ""
+                parent_id = str(getattr(parent, "message_id", "") or "")
+                normalized = normalize_feishu_message(
+                    message_type=msg_type,
+                    raw_content=raw_content,
+                    mentions=getattr(parent, "mentions", None),
+                    bot=self._bot_identity(),
+                )
+                media_urls, media_types = await self._download_feishu_message_resources(
+                    message_id=parent_id,
+                    normalized=normalized,
+                )
+                if media_urls:
+                    logger.info(
+                        "[Feishu] Lookback attached %d media resource(s) from recent history %s",
+                        len(media_urls), parent_id,
+                    )
+                    return media_urls, media_types, parent_id
+            return [], [], None
+        except Exception:
+            logger.warning("[Feishu] History lookback failed for %s", chat_id, exc_info=True)
+            return [], [], None
+
+    async def _fetch_reply_media(self, message_id: str) -> tuple[List[str], List[str]]:
+        """A group file/image has no text, so it can never carry the @-mention
+        the group policy requires — mention-gated groups used to drop the
+        attachment itself and the agent only ever saw "[Attachment: name]".
+        When a user @-mentions the bot AS A REPLY to a media message, fetch
+        that parent message and attach its resources to the mentioning event
+        (the same normalize + cache path a direct media event takes)."""
+        if not self._client or not message_id:
+            return [], []
+        try:
+            request = self._build_get_message_request(message_id)
+            response = await self._run_blocking(self._client.im.v1.message.get, request)
+            if not response or getattr(response, "success", lambda: False)() is False:
+                return [], []
+            items = getattr(getattr(response, "data", None), "items", None) or []
+            parent = items[0] if items else None
+            if parent is None:
+                return [], []
+            body = getattr(parent, "body", None)
+            msg_type = (getattr(parent, "msg_type", "") or "").strip()
+            raw_content = getattr(body, "content", "") or ""
+            if msg_type in {"text", "interactive"}:
+                return [], []          # pure text parents carry no resources
+            normalized = normalize_feishu_message(
+                message_type=msg_type,
+                raw_content=raw_content,
+                mentions=getattr(parent, "mentions", None),
+                bot=self._bot_identity(),
+            )
+            media_urls, media_types = await self._download_feishu_message_resources(
+                message_id=message_id,
+                normalized=normalized,
+            )
+            if media_urls:
+                logger.info(
+                    "[Feishu] Attached %d reply-referenced media resource(s) from %s",
+                    len(media_urls), message_id,
+                )
+            return media_urls, media_types
+        except Exception:
+            logger.warning("[Feishu] Failed to fetch reply-referenced media %s", message_id, exc_info=True)
+            return [], []
 
     async def _fetch_message_text(self, message_id: str) -> Optional[str]:
         if not self._client or not message_id:
