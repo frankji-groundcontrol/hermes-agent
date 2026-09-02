@@ -13,11 +13,24 @@ from hermes_cli.main import cmd_update, PROJECT_ROOT
 @pytest.fixture(autouse=True)
 def _isolate_update_checkout(monkeypatch, tmp_path):
     from hermes_cli import main as hm
+    from hermes_cli import gateway as gw
+    import tests.hermes_cli.test_cmd_update as this_mod
 
     checkout = tmp_path / "project-root"
     checkout.mkdir()
     (checkout / ".git").mkdir()
     monkeypatch.setattr(hm, "PROJECT_ROOT", checkout)
+    # The module-level import is a snapshot; keep it aligned with the patched
+    # runtime root so upstream assertions using PROJECT_ROOT stay hermetic.
+    monkeypatch.setattr(this_mod, "PROJECT_ROOT", checkout)
+    # Updater tests must never discover or signal the host's live gateways.
+    monkeypatch.setattr(gw, "find_gateway_pids", lambda *a, **k: [])
+    monkeypatch.setattr(gw, "kill_gateway_processes", lambda *a, **k: [])
+    monkeypatch.setattr(gw, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(gw, "find_profile_gateway_processes", lambda *a, **k: [])
+    # update_cmd also does local imports; patch the module attrs if bound.
+    import hermes_cli.update_cmd as update_cmd
+    monkeypatch.setattr(update_cmd, "find_gateway_pids", lambda *a, **k: [], raising=False)
 
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
@@ -1147,6 +1160,8 @@ class TestNodeRuntimeNpmResolution:
         from hermes_cli import update_cmd
 
         desktop_dir = PROJECT_ROOT / "apps" / "desktop"
+        desktop_dir.mkdir(parents=True)
+        (desktop_dir / "package.json").write_text("{}", encoding="utf-8")
         packaged_exe = desktop_dir / "release" / "win-unpacked" / "Hermes.exe"
         build_ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
 
