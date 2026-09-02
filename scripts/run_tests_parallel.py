@@ -380,10 +380,11 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
+    basetemp = tempfile.TemporaryDirectory(prefix="hermes-pytest-")
     options_end = pytest_args.index("--") if "--" in pytest_args else len(pytest_args)
     cmd = [
         sys.executable, "-m", "pytest", str(file),
-        *pytest_args[:options_end],
+        *pytest_args[:options_end], f"--basetemp={basetemp.name}",
         *pytest_args[options_end:],
     ]
 
@@ -464,6 +465,7 @@ def _run_one_file_once(
         # subprocess exits. More than 3000 of them fill the disk of the
         # runner over one suite.
         shutil.rmtree(temproot, ignore_errors=True)
+        basetemp.cleanup()
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
