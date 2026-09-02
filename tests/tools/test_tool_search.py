@@ -85,6 +85,122 @@ class TestClassification:
         for name in BRIDGE_TOOL_NAMES:
             assert not is_deferrable_tool_name(name)
 
+    def test_gui_surface_tools_never_defer(self):
+        """Session-gated GUI tools stay direct and stay off the global core list."""
+        from tools.registry import discover_builtin_tools
+        from tools.tool_search import is_deferrable_tool_name
+        from toolsets import _HERMES_CORE_TOOLS
+
+        discover_builtin_tools()
+        for name in ("read_window_below", "apply_layout", "project_list"):
+            assert not is_deferrable_tool_name(name), name
+            assert name not in _HERMES_CORE_TOOLS
+
+    def test_gui_surface_defers_by_default(self):
+        """2026-08 core-deferral reversal: the curated defer set (GUI surface
+        included) hides behind the bridge BY DEFAULT. project tools not in
+        the defer set stay direct."""
+        from tools.registry import discover_builtin_tools
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs
+
+        discover_builtin_tools()
+        assembled = assemble_tool_defs(
+            [_td(name, f"GUI {name}") for name in
+             {"read_window_below", "apply_layout", "project_list"}],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        assert assembled.activated
+        names = {td["function"]["name"] for td in assembled.tool_defs}
+        assert "read_window_below" not in names
+        assert "apply_layout" not in names
+        # project_list is NOT in the curated defer set → stays direct.
+        assert "project_list" in names
+
+    def test_defer_override_restores_legacy_direct_gui(self):
+        """tools.tool_search.defer: [] restores the everything-eager legacy:
+        GUI tools alone no longer activate the bridge."""
+        from tools.registry import discover_builtin_tools
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs
+
+        discover_builtin_tools()
+        names = {"read_window_below", "apply_layout", "project_list"}
+        assembled = assemble_tool_defs(
+            [_td(name, f"GUI {name}") for name in names],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on", "defer": []}),
+        )
+        assert not assembled.activated
+        assert {td["function"]["name"] for td in assembled.tool_defs} == names
+
+    def test_core_working_set_never_defers_even_with_mcp_active(self):
+        """The bridge activates for MCP, but working-set core tools (terminal,
+        files, memory...) stay direct — the deferral set is the CURATED list,
+        not all of core."""
+        from tools.registry import discover_builtin_tools, registry
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            ToolSearchConfig,
+            assemble_tool_defs,
+        )
+
+        discover_builtin_tools()
+        mcp_name = "mcp_gui_surface_probe"
+        registry.register(
+            name=mcp_name,
+            handler=lambda args, **kw: "{}",
+            schema=_td(mcp_name, "Deferred MCP capability")["function"],
+            toolset="mcp-gui-surface-probe",
+        )
+
+        assembled = assemble_tool_defs(
+            [
+                _td("terminal", "Run a command"),
+                _td("memory", "Persistent memory"),
+                _td("computer_use", "Drive the OS"),
+                _td(mcp_name, "Deferred MCP capability"),
+            ],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        names = {td["function"]["name"] for td in assembled.tool_defs}
+
+        assert assembled.activated
+        assert mcp_name not in names
+        assert BRIDGE_TOOL_NAMES <= names
+        assert {"terminal", "memory"} <= names
+        # computer_use IS in the curated defer set → behind the bridge.
+        assert "computer_use" not in names
+
+    def test_clarify_stays_eager_by_default(self):
+        """PR #97979 A/B verdict (288 runs, 3 model tiers): clarify deferred
+        collapsed structured ask-the-user usage 18/18 → 7/18 (gpt-terra 0/6);
+        models fell back to plain-text questions. The ask-the-user affordance
+        must stay ambient — clarify is NOT in the curated default defer set,
+        and assembles as a direct tool even when the bridge is active."""
+        from tools.registry import discover_builtin_tools
+        from tools.tool_search import (
+            _DEFAULT_DEFERRED_TOOLS,
+            ToolSearchConfig,
+            assemble_tool_defs,
+        )
+
+        assert "clarify" not in _DEFAULT_DEFERRED_TOOLS
+
+        discover_builtin_tools()
+        assembled = assemble_tool_defs(
+            [
+                _td("clarify", "Ask the user clarifying questions"),
+                _td("computer_use", "Drive the OS"),
+            ],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        assert assembled.activated  # computer_use still activates the bridge
+        names = {td["function"]["name"] for td in assembled.tool_defs}
+        assert "clarify" in names
+        assert "computer_use" not in names
+
     def test_unknown_tool_not_deferrable(self):
         """Defensive: a tool name we cannot resolve to a registry entry must
         not be claimed as deferrable. This protects against the OpenClaw
@@ -226,10 +342,24 @@ class TestAssembly:
 
 
 class TestBridgeDispatch:
-    def test_tool_search_requires_query(self):
+    def test_tool_search_requires_queries(self):
         from tools.tool_search import dispatch_tool_search
         result = dispatch_tool_search({}, current_tool_defs=[])
         assert "error" in json.loads(result)
+
+    def test_tool_search_rejects_empty_and_overcap_queries(self):
+        import tools.tool_search as tool_search
+
+        cfg = tool_search.ToolSearchConfig.from_raw({})
+        assert "error" in json.loads(tool_search.dispatch_tool_search(
+            {"queries": []}, current_tool_defs=[], config=cfg))
+        assert "error" in json.loads(tool_search.dispatch_tool_search(
+            {"queries": ["  ", ""]}, current_tool_defs=[], config=cfg))
+        over = ["q"] * (tool_search._MAX_QUERIES_PER_CALL + 1)
+        parsed = json.loads(tool_search.dispatch_tool_search(
+            {"queries": over}, current_tool_defs=[], config=cfg))
+        assert "error" in parsed
+        assert "too many queries" in parsed["error"]
 
     def test_empty_search_keeps_connected_sources_discoverable(self):
         from tools.registry import registry
@@ -245,17 +375,21 @@ class TestBridgeDispatch:
         )
 
         result = json.loads(dispatch_tool_search(
-            {"query": "unrelated vocabulary"},
+            {"queries": ["unrelated vocabulary"]},
             current_tool_defs=[tool_def],
         ))
 
-        assert result["matches"] == []
+        [group] = result["results"]
+        assert group["query"] == "unrelated vocabulary"
+        assert group["matches"] == []
+        assert result["tools"] == {}
         assert result["total_available"] == 1
-        assert result["available_sources"] == [
+        assert group["available_sources"] == [
             {"name": "recovery-catalog", "tool_count": 1},
         ]
-        assert "remain available" in result["hint"]
-        assert "before concluding" in result["hint"]
+        assert "remain available" in group["hint"]
+        assert "before concluding" in group["hint"]
+        assert "available_sources" not in result
 
 
     def test_resolve_underlying_call_parses_object_args(self):
@@ -290,12 +424,12 @@ class TestHandleFunctionCallIntegration:
         import model_tools
         result = model_tools.handle_function_call(
             function_name="tool_search",
-            function_args={"query": "nothing matches this"},
+            function_args={"queries": ["nothing matches this"]},
         )
         parsed = json.loads(result)
         # Without a real registry, the matches will be empty, but the
         # dispatch path completed without error.
-        assert "matches" in parsed or "error" in parsed
+        assert "results" in parsed or "error" in parsed
 
     def test_tool_search_emits_one_terminal_hook(self, monkeypatch):
         """Inline bridge results still complete the tool lifecycle."""
@@ -317,12 +451,12 @@ class TestHandleFunctionCallIntegration:
         monkeypatch.setattr(
             tool_search,
             "dispatch_tool_search",
-            lambda *args, **kwargs: json.dumps({"matches": []}),
+            lambda *args, **kwargs: json.dumps({"results": []}),
         )
 
         result = model_tools.handle_function_call(
             function_name="tool_search",
-            function_args={"query": "private-query"},
+            function_args={"queries": ["private-query"]},
             session_id="private-session",
             task_id="private-task",
             turn_id="private-turn",
@@ -330,7 +464,7 @@ class TestHandleFunctionCallIntegration:
             tool_call_id="private-call",
         )
 
-        assert json.loads(result) == {"matches": []}
+        assert json.loads(result) == {"results": []}
         assert len(events) == 1
         hook_name, payload = events[0]
         assert hook_name == "post_tool_call"
@@ -433,7 +567,7 @@ class TestRegression_ToolsetScoping:
         # out-of-scope plugin tool (or any of the host registry).
         result = model_tools.handle_function_call(
             function_name="tool_search",
-            function_args={"query": "mcp_scoped_gh", "limit": 5},
+            function_args={"queries": ["mcp_scoped_gh"], "limit": 5},
             enabled_toolsets=["mcp-scoped-gh"],
         )
         parsed = json.loads(result)
@@ -441,7 +575,8 @@ class TestRegression_ToolsetScoping:
             f"expected scoped catalog of 12, got {parsed['total_available']} "
             "— catalog leaked tools outside the session's toolsets"
         )
-        hit_names = {m["name"] for m in parsed["matches"]}
+        hit_names = set(parsed["tools"])
+        assert hit_names == {n for g in parsed["results"] for n in g["matches"]}
         assert "scoped_oos_plugin" not in hit_names
 
 
