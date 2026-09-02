@@ -6029,8 +6029,16 @@ class BasePlatformAdapter(ABC):
             "group_sessions_per_user": extra.get("group_sessions_per_user", True),
             "thread_sessions_per_user": extra.get("thread_sessions_per_user", False),
         }
-        alias_key = build_session_key(alias_source, **key_args)
-        target_key = build_session_key(target_source, **key_args)
+        alias_key = build_session_key(
+            alias_source,
+            profile=self._session_key_profile(alias_source),
+            **key_args,
+        )
+        target_key = build_session_key(
+            target_source,
+            profile=self._session_key_profile(target_source),
+            **key_args,
+        )
         active_sessions = getattr(self, "_active_sessions", {})
         if alias_key != target_key and target_key in active_sessions:
             aliases = getattr(self, "_inflight_session_aliases", None)

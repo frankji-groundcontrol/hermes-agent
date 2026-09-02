@@ -212,6 +212,7 @@ def test_bootstrap_alias_keeps_profile_identity_and_active_guard(tmp_path):
         source,
         group_sessions_per_user=True,
         thread_sessions_per_user=True,
+        profile=source.profile,
     )
     adapter._active_sessions[provisional_key] = asyncio.Event()
     adapter._bind_bootstrap_thread_session(
