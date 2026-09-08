@@ -5084,6 +5084,35 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_create_message_request("thread_id", body)
+            response = await self._run_blocking(self._client.im.v1.message.create, request)
+            if self._response_succeeded(response) or str(getattr(response, "code", "")) != "99992402":
+                return response
+            # Live-API gap (A/B-tested 2026-09-08): the public send API
+            # rejects receive_id_type=thread_id with 99992402 (field
+            # validation failed). Strict thread delivery never falls back to
+            # the main chat: reply to the newest in-topic message via the
+            # Reply API, which the live surface accepts for topic routing.
+            anchor = await self._fetch_last_message_in_thread(_thread_id)
+            if anchor:
+                logger.warning(
+                    "[Feishu] thread_id receive rejected (code 99992402); "
+                    "delivering via reply into thread %s",
+                    _thread_id,
+                )
+                reply_body = self._build_reply_message_body(
+                    content=payload,
+                    msg_type=msg_type,
+                    reply_in_thread=True,
+                    uuid_value=str(uuid.uuid4()),
+                )
+                reply_request = self._build_reply_message_request(anchor, reply_body)
+                return await self._run_blocking(self._client.im.v1.message.reply, reply_request)
+            logger.warning(
+                "[Feishu] thread_id receive rejected (code 99992402) and no in-thread "
+                "anchor found for %s; failing closed (no flat fallback)",
+                _thread_id,
+            )
+            return response
         else:
             receive_id = chat_id
             receive_id_type = "chat_id"

@@ -171,6 +171,25 @@ _HYGIENE_COOLDOWN_MAX_SECONDS = 3600.0
 _HYGIENE_TURNHOLD_RETRY_SECONDS = 60.0
 
 
+
+def _format_iteration_detail(current, maximum) -> str:
+    """Busy-status iteration text.
+
+    ``sys.maxsize`` is the agent object's unlimited sentinel (``agent_init``
+    default); the effective budget lives in the separate iteration-budget
+    mechanism and never reaches that attribute on gateway runs. Render a
+    denominator only for real caps so user-facing status never shows
+    ``iteration N/9223372036854775807``.
+    """
+    try:
+        has_cap = bool(maximum) and int(maximum) < sys.maxsize
+    except (TypeError, ValueError):
+        has_cap = False
+    if has_cap:
+        return f"iteration {current}/{maximum}"
+    return f"iteration {current}"
+
+
 def _hygiene_cooldown_for_failure(
     gateway,
     session_key: str,
@@ -11379,7 +11398,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if elapsed_min > 0:
                         status_parts.append(f"{elapsed_min} min elapsed")
                 if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
+                    status_parts.append(_format_iteration_detail(iteration, max_iter))
                 if current_tool:
                     status_parts.append(f"running: {current_tool}")
             except Exception:
@@ -31198,7 +31217,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _parts = []
                         if _want_iteration_detail:
                             _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
+                                _format_iteration_detail(
+                                    _a.get("api_call_count"), _a.get("max_iterations")
+                                )
                             )
                         _action = _a.get("current_tool") or _a.get("last_activity_desc")
                         if _action:
@@ -31555,12 +31576,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _diag_lines.append(
                         f"The agent appears stuck on tool `{_cur_tool}` "
                         f"({_secs_ago:.0f}s since last activity, "
-                        f"iteration {_iter_n}/{_iter_max})."
+                        f"{_format_iteration_detail(_iter_n, _iter_max)})."
                     )
                 else:
                     _diag_lines.append(
                         f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
-                        f"iteration {_iter_n}/{_iter_max}). "
+                        f"{_format_iteration_detail(_iter_n, _iter_max)}). "
                         "The agent may have been waiting on an API response."
                     )
                 _diag_lines.append(
