@@ -144,6 +144,7 @@ class TestStreamedVisionCompletion:
         assert resp.choices[0].message.content == ""
         assert seen["model"] == "override-model"
         assert seen["stream"] is True
+        assert seen["max_tokens"] == 4000
 
     @pytest.mark.asyncio
     async def test_failure_returns_none_not_raise(self, monkeypatch):

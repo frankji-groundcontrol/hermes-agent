@@ -1453,12 +1453,20 @@ async def _streamed_vision_completion(
         )
         content_parts: list = []
         reasoning_parts: list = []
-        stream = await client.chat.completions.create(
-            model=eff_model,
-            messages=messages,
-            temperature=temperature,
-            stream=True,
+        stream_kwargs = {
+            "model": eff_model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+        # Some chat-completions bridges (sub2api over a Responses upstream)
+        # only complete streamed image requests when a token cap is present;
+        # harmless elsewhere, and a provider that rejects it lands in the
+        # except-branch below which falls back to the non-streaming call.
+        stream_kwargs["max_tokens"] = int(
+            vision_cfg.get("stream_max_tokens") or 4000
         )
+        stream = await client.chat.completions.create(**stream_kwargs)
         async for chunk in stream:
             choices = getattr(chunk, "choices", None) or []
             if not choices:
