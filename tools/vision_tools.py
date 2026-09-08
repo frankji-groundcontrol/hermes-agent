@@ -1433,7 +1433,9 @@ async def _streamed_vision_completion(
     required for gateways whose non-streaming bridge is broken (sub2api
     issues #1493/#1552/#5323) while their streamed path answers 200.
     """
-    if not vision_cfg or not vision_cfg.get("stream"):
+    # "stream" is the historical on-switch; a "wire" selection now
+    # engages the helper on its own (non-streaming responses path).
+    if not vision_cfg or not (vision_cfg.get("stream") or vision_cfg.get("wire")):
         return None
     base_url = vision_cfg.get("base_url")
     api_key = vision_cfg.get("api_key")
