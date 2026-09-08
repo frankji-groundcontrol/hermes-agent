@@ -223,3 +223,35 @@ class TestVisionAnalyzeToolStreamingIntegration:
             )
         assert "router description" in result
         router.assert_awaited_once()
+
+
+class TestResponsesWire:
+    @pytest.mark.asyncio
+    async def test_wire_responses_uses_nonstreaming_responses(self, monkeypatch):
+        import openai
+        from types import SimpleNamespace
+
+        calls = {}
+
+        class _FakeResponses:
+            async def create(self, **kwargs):
+                calls.update(kwargs)
+                return SimpleNamespace(output_text="a calm sea")
+
+        def fake_client(**kwargs):
+            return SimpleNamespace(responses=_FakeResponses())
+
+        monkeypatch.setattr(openai, "AsyncOpenAI", fake_client)
+        cfg = dict(FULL_CFG, wire="responses")
+        resp = await vt._streamed_vision_completion(
+            [{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+            ]}],
+            vision_cfg=cfg, timeout=5, temperature=0.1,
+        )
+        assert resp.choices[0].message.content == "a calm sea"
+        assert "stream" not in calls
+        assert calls["max_output_tokens"] == 4000
+        part = calls["input"][0]["content"][1]
+        assert part["type"] == "input_image" and part["image_url"].startswith("data:image/png")

@@ -1445,6 +1445,40 @@ async def _streamed_vision_completion(
         )
         return None
     try:
+        if vision_cfg.get("wire") == "responses":
+            # Non-streaming Responses wire. On gateways whose chat bridge is
+            # broken AND whose streamed image generations die mid-flight,
+            # POST /responses without stream:true is the one path proven to
+            # complete (verified end-to-end with real images).
+            import openai
+            from types import SimpleNamespace
+
+            client = openai.AsyncOpenAI(
+                base_url=base_url, api_key=api_key, timeout=timeout
+            )
+            resp_input = []
+            for msg in messages:
+                role = msg.get("role", "user") if isinstance(msg, dict) else "user"
+                content = msg.get("content") if isinstance(msg, dict) else msg
+                parts = []
+                if isinstance(content, str):
+                    parts.append({"type": "input_text", "text": content})
+                else:
+                    for p in content or []:
+                        if p.get("type") == "text":
+                            parts.append({"type": "input_text", "text": p.get("text", "")})
+                        elif p.get("type") == "image_url":
+                            parts.append({"type": "input_image",
+                                          "image_url": (p.get("image_url") or {}).get("url", "")})
+                resp_input.append({"role": role, "content": parts})
+            resp = await client.responses.create(
+                model=eff_model,
+                input=resp_input,
+                max_output_tokens=int(vision_cfg.get("stream_max_tokens") or 4000),
+            )
+            text = (getattr(resp, "output_text", None) or "").strip()
+            message = SimpleNamespace(content=text, reasoning_content=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
         import openai
         from types import SimpleNamespace
 
