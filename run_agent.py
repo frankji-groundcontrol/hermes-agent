@@ -7670,9 +7670,12 @@ class AIAgent:
         )
 
         vision_source = str(image_url or "")
+        # Data URLs resolve in-process (tools/image_source.py); handing the
+        # resolver a host temp path instead breaks under docker sandboxes
+        # (SourceNotFound -- path outside the media caches, no active
+        # sandbox session), so pass the data URL through unchanged. The
+        # materializer stays for callers that genuinely need a file path.
         cleanup_path: Optional[Path] = None
-        if vision_source.startswith("data:"):
-            vision_source, cleanup_path = self._materialize_data_url_for_vision(vision_source)
 
         description = ""
         try:

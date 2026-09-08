@@ -1415,6 +1415,76 @@ async def _vision_analyze_native(
                 pass
 
 
+async def _streamed_vision_completion(
+    messages: list,
+    *,
+    vision_cfg: dict,
+    timeout: float,
+    temperature: float,
+    model=None,
+):
+    """Opt-in streaming vision call with client-side aggregation.
+
+    Engages only when ``auxiliary.vision.stream`` is truthy AND the vision
+    block fully specifies ``base_url``/``api_key``/``model``; aggregates a
+    streamed chat-completions response into the ``choices[0].message`` shape
+    that ``extract_content_or_reasoning`` already consumes. Returns ``None``
+    (never raises) so callers fall back to the non-streaming router path --
+    required for gateways whose non-streaming bridge is broken (sub2api
+    issues #1493/#1552/#5323) while their streamed path answers 200.
+    """
+    if not vision_cfg or not vision_cfg.get("stream"):
+        return None
+    base_url = vision_cfg.get("base_url")
+    api_key = vision_cfg.get("api_key")
+    eff_model = model or vision_cfg.get("model")
+    if not (base_url and api_key and eff_model):
+        logger.warning(
+            "auxiliary.vision.stream is enabled but base_url/api_key/model "
+            "are not all configured; falling back to the non-streaming call"
+        )
+        return None
+    try:
+        import openai
+        from types import SimpleNamespace
+
+        client = openai.AsyncOpenAI(
+            base_url=base_url, api_key=api_key, timeout=timeout
+        )
+        content_parts: list = []
+        reasoning_parts: list = []
+        stream = await client.chat.completions.create(
+            model=eff_model,
+            messages=messages,
+            temperature=temperature,
+            stream=True,
+        )
+        async for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue  # keep-alive / empty-choice chunks
+            delta = getattr(choices[0], "delta", None)
+            if delta is None:
+                continue
+            piece = getattr(delta, "content", None)
+            if piece:
+                content_parts.append(piece)
+            piece = getattr(delta, "reasoning_content", None)
+            if isinstance(piece, str) and piece:
+                reasoning_parts.append(piece)
+        message = SimpleNamespace(
+            content="".join(content_parts),
+            reasoning_content="".join(reasoning_parts) or None,
+        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+    except Exception as exc:
+        logger.warning(
+            "Streaming vision call failed (%s); falling back to "
+            "non-streaming", exc,
+        )
+        return None
+
+
 async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
@@ -1604,6 +1674,7 @@ async def vision_analyze_tool(
         # Local vision models (llama.cpp, ollama) can take well over 30s.
         vision_timeout = 120.0
         vision_temperature = 0.1
+        _vision_cfg: dict = {}
         try:
             from hermes_cli.config import cfg_get, load_config
             _cfg = load_config()
@@ -1616,6 +1687,20 @@ async def vision_analyze_tool(
                 vision_temperature = float(_vtemp)
         except Exception:
             pass
+        async def _call_vision_llm():
+            # Streaming-first when opted in (auxiliary.vision.stream); any
+            # miss falls back to the shared non-streaming router call.
+            streamed = await _streamed_vision_completion(
+                messages,
+                vision_cfg=_vision_cfg,
+                timeout=vision_timeout,
+                temperature=vision_temperature,
+                model=model,
+            )
+            if streamed is not None:
+                return streamed
+            return await async_call_llm(**call_kwargs)
+
         call_kwargs = {
             "task": "vision",
             "messages": messages,
@@ -1627,7 +1712,7 @@ async def vision_analyze_tool(
         _load_auxiliary_client()
         # Try full-size image first; on size-related rejection, downscale and retry.
         try:
-            response = await async_call_llm(**call_kwargs)
+            response = await _call_vision_llm()
         except Exception as _api_err:
             if (_is_image_size_error(_api_err)
                     and len(image_data_url) > _RESIZE_TARGET_BYTES):
@@ -1642,7 +1727,7 @@ async def vision_analyze_tool(
                     temp_image_path, mime_type=detected_mime_type,
                     scale_out=_scale_info)
                 messages[0]["content"][1]["image_url"]["url"] = image_data_url
-                response = await async_call_llm(**call_kwargs)
+                response = await _call_vision_llm()
             else:
                 raise
         
@@ -1652,7 +1737,7 @@ async def vision_analyze_tool(
         # Retry once on empty content (reasoning-only response)
         if not analysis:
             logger.warning("Vision LLM returned empty content, retrying once")
-            response = await async_call_llm(**call_kwargs)
+            response = await _call_vision_llm()
             analysis = extract_content_or_reasoning(response)
 
         analysis_length = len(analysis)
