@@ -687,6 +687,11 @@ def cleanup_all_browsers() -> None:
     except Exception:
         pass
 
+    # Explicit reload must also defeat same-size writes within one filesystem
+    # clock tick, which the raw-config stat cache cannot distinguish.
+    from hermes_cli import config
+    with config._CONFIG_LOCK:
+        config._RAW_CONFIG_CACHE.clear()
     _install._discover_homebrew_node_dirs.cache_clear()
     # Each resolved flag flips BEFORE its cache is nulled so a concurrent reader never
     # sees ``resolved=True`` with ``cache=None``.

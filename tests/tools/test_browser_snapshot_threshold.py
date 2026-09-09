@@ -1,6 +1,7 @@
 """Behavior tests for config-driven browser snapshot thresholds."""
 
 import json
+import os
 from unittest.mock import Mock
 
 import pytest
@@ -69,8 +70,13 @@ def test_invalid_values_fall_back_to_default(isolated_snapshot_threshold):
 def test_cleanup_reloads_updated_profile_config(isolated_snapshot_threshold):
     _write_threshold(isolated_snapshot_threshold, 12000)
     assert browser_tool.get_browser_snapshot_threshold() == 12000
+    config_path = isolated_snapshot_threshold / "config.yaml"
+    before = config_path.stat()
 
     _write_threshold(isolated_snapshot_threshold, 15001)
+    # Same-size writes can share a filesystem timestamp; explicit cleanup must
+    # invalidate the raw-config cache even when its stat signature is unchanged.
+    os.utime(config_path, ns=(before.st_atime_ns, before.st_mtime_ns))
     assert browser_tool.get_browser_snapshot_threshold() == 12000
 
     bt_lifecycle.cleanup_all_browsers()
