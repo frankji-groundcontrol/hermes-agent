@@ -225,8 +225,7 @@ class TestAdapterTruthTable:
         assert settings.group_policy == "disabled"
         assert settings.allowed_group_users == frozenset({"ou_this_profile"})
         assert settings.require_mention is False
-        assert settings.allow_all_users is False
-        assert settings.gateway_allow_all_users is False
+        assert settings.allow_all_dm is False
 
     def test_listed_group_unknown_human_with_mention_admitted(self, monkeypatch):
         _set_listed(monkeypatch)

@@ -74,24 +74,25 @@ def _capture(source_filter: str = "all") -> str:
 
 
 def _capture_check(monkeypatch, results, name=None) -> str:
-    import tools.skills_hub as hub
+    import tools.skills_hub_install as hub_install
 
     sink = StringIO()
     console = Console(file=sink, force_terminal=False, color_system=None)
-    monkeypatch.setattr(hub, "check_for_skill_updates", lambda **_kwargs: results)
+    monkeypatch.setattr(hub_install, "check_for_skill_updates", lambda **_kwargs: results)
     do_check(name=name, console=console)
     return sink.getvalue()
 
 
 def _capture_update(monkeypatch, results) -> tuple[str, list[tuple[str, str, bool]]]:
     import tools.skills_hub as hub
+    import tools.skills_hub_install as hub_install
     import hermes_cli.skills_hub as cli_hub
 
     sink = StringIO()
     console = Console(file=sink, force_terminal=False, color_system=None)
     installs = []
 
-    monkeypatch.setattr(hub, "check_for_skill_updates", lambda **_kwargs: results)
+    monkeypatch.setattr(hub_install, "check_for_skill_updates", lambda **_kwargs: results)
     monkeypatch.setattr(hub, "HubLockFile", lambda: type("L", (), {
         "get_installed": lambda self, name: {"install_path": "category/" + name}
     })())
@@ -165,7 +166,7 @@ def test_do_inspect_reads_an_installed_local_skill_before_registry_lookup(monkey
         "---\nname: daily-knowledge-synthesis\ndescription: Inspect local snapshots.\n---\n\n# Local skill\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(hub, "create_source_router", lambda _auth: pytest.fail("registry lookup"))
+    monkeypatch.setattr("hermes_cli.skills_hub._sources", lambda: pytest.fail("registry lookup"))
     sink = StringIO()
     console = Console(file=sink, force_terminal=False, color_system=None)
 
@@ -175,6 +176,13 @@ def test_do_inspect_reads_an_installed_local_skill_before_registry_lookup(monkey
     assert "daily-knowledge-synthesis" in output
     assert "Source: local" in output
     assert "local-skill" not in output
+
+    from hermes_cli.skills_hub import inspect_skill
+
+    info = inspect_skill("daily-knowledge-synthesis")
+    assert info["source"] == "local"
+    assert info["name"] == "daily-knowledge-synthesis"
+    assert "# Local skill" in info["skill_md_preview"]
 
 
 def test_do_inspect_reads_external_bom_skill_and_rejects_collisions(monkeypatch, hub_env, tmp_path):
@@ -189,7 +197,7 @@ def test_do_inspect_reads_external_bom_skill_and_rejects_collisions(monkeypatch,
         encoding="utf-8",
     )
     monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda: [external])
-    monkeypatch.setattr(hub, "create_source_router", lambda _auth: pytest.fail("registry lookup"))
+    monkeypatch.setattr("hermes_cli.skills_hub._sources", lambda: pytest.fail("registry lookup"))
 
     sink = StringIO()
     do_inspect("shared-skill", console=Console(file=sink, force_terminal=False, color_system=None))
@@ -292,7 +300,7 @@ def test_do_list_platform_env_is_ignored(three_source_env, monkeypatch):
 
 
 
-def test_check_for_skill_updates_does_not_fall_back_across_registries():
+def test_check_for_skill_updates_does_not_fall_back_across_registries(tmp_path, monkeypatch):
     """An entry whose source has no adapter reports `unavailable`.
 
     Previously `candidate_sources ... or sources` fell back to every source, so
@@ -302,7 +310,7 @@ def test_check_for_skill_updates_does_not_fall_back_across_registries():
     the old code reports `update_available` (sourced from the wrong registry)
     while the fixed code reports `unavailable`.
     """
-    from tools.skills_hub import check_for_skill_updates
+    from tools.skills_hub_install import check_for_skill_updates
 
     class _ForeignBundle:
         name = "reddit"
@@ -324,9 +332,12 @@ def test_check_for_skill_updates_does_not_fall_back_across_registries():
         def inspect(self, identifier):
             return _ForeignBundle()
 
+    from tools import skills_hub as hub
+    monkeypatch.setattr(hub, "SKILLS_DIR", tmp_path)
+    (tmp_path / "reddit").mkdir()
     lock = _DummyLockFile([
         {"name": "reddit", "identifier": "reddit", "source": "clawhub",
-         "content_hash": "hash-of-the-clawhub-copy"},
+         "install_path": "reddit", "content_hash": "hash-of-the-clawhub-copy"},
     ])
 
     results = check_for_skill_updates(
@@ -352,7 +363,7 @@ def test_resolve_does_not_pair_catalog_meta_with_foreign_same_name_bundle():
     showed the wrong skill.
     """
     from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
-    from tools.skills_hub import SkillBundle, SkillMeta
+    from tools.skills_hub_models import SkillBundle, SkillMeta
 
     class CatalogSource:
         def inspect(self, identifier):
@@ -403,7 +414,7 @@ def test_resolve_does_not_pair_catalog_meta_with_foreign_same_name_bundle():
 
 def test_resolve_keeps_catalog_meta_when_later_sources_do_not_fetch():
     from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
-    from tools.skills_hub import SkillMeta
+    from tools.skills_hub_models import SkillMeta
 
     class CatalogSource:
         def inspect(self, identifier):
@@ -475,6 +486,8 @@ def _make_url_bundle_fetcher(name="", awaiting_name=True, url="https://example.c
 def _install_mocks(monkeypatch, tmp_path, source_factory, category_hint=""):
     """Wire the minimum set of monkeypatches for a do_install dry run."""
     import tools.skills_hub as hub
+    import tools.skills_hub_install as hub_install
+    import tools.skills_hub_search as hub_search
     import tools.skills_guard as guard
 
     q_path = tmp_path / "skills" / ".hub" / "quarantine" / "pending"
@@ -489,9 +502,9 @@ def _install_mocks(monkeypatch, tmp_path, source_factory, category_hint=""):
         return install_dir
 
     monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [source_factory()])
-    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: q_path)
-    monkeypatch.setattr(hub, "install_from_quarantine", _install_from_quarantine)
+    monkeypatch.setattr(hub_search, "create_source_router", lambda auth: [source_factory()])
+    monkeypatch.setattr(hub_install, "quarantine_bundle", lambda bundle: q_path)
+    monkeypatch.setattr(hub_install, "install_from_quarantine", _install_from_quarantine)
     monkeypatch.setattr(
         hub, "HubLockFile",
         lambda: type("Lock", (), {"get_installed": lambda self, n: None})(),
@@ -549,9 +562,9 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     sink = StringIO()
     console = Console(file=sink, force_terminal=False, color_system=None, width=40)
 
-    with patch("tools.skills_hub.unified_search", return_value=[_LONG_RESULT]), \
-         patch("tools.skills_hub.create_source_router", return_value={}), \
-         patch("tools.skills_hub.GitHubAuth"):
+    with patch("tools.skills_hub_search.unified_search", return_value=[_LONG_RESULT]), \
+         patch("tools.skills_hub_search.create_source_router", return_value={}), \
+         patch("tools.skills_hub_github.GitHubAuth"):
         do_search("weather", console=console, as_json=True)
 
     # JSON goes to stdout via print(), not the Rich console sink.
@@ -579,6 +592,7 @@ def _update_env(monkeypatch, tmp_path, *, edit_after_install: bool):
     """
     import hermes_cli.skills_hub as cli_hub
     import tools.skills_hub as hub
+    import tools.skills_hub_install as hub_install
     from tools.skills_guard import content_hash
 
     skills_dir = tmp_path / "skills"
@@ -591,7 +605,7 @@ def _update_env(monkeypatch, tmp_path, *, edit_after_install: bool):
         (skill_dir / "SKILL.md").write_text("# hub-skill\nuser edited\n")
 
     monkeypatch.setattr(hub, "SKILLS_DIR", skills_dir)
-    monkeypatch.setattr(hub, "check_for_skill_updates", lambda **_kwargs: [{
+    monkeypatch.setattr(hub_install, "check_for_skill_updates", lambda **_kwargs: [{
         "name": "hub-skill",
         "identifier": "someone/hub-skill",
         "source": "github",

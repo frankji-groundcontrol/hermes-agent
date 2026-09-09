@@ -248,7 +248,8 @@ def test_bootstrap_alias_keeps_profile_identity_and_active_guard(tmp_path):
     assert adapter._pending_messages[provisional_key] is follow_up
 
 
-def test_runner_uses_profiled_provisional_key_but_adapter_queue_key(tmp_path):
+@pytest.mark.parametrize("adapter_profile", [None, "secondary"])
+def test_runner_uses_profiled_provisional_key_but_adapter_queue_key(tmp_path, adapter_profile):
     from gateway.run import GatewayRunner
 
     config = GatewayConfig(
@@ -275,6 +276,7 @@ def test_runner_uses_profiled_provisional_key_but_adapter_queue_key(tmp_path):
         _provisional(),
         group_sessions_per_user=True,
         thread_sessions_per_user=True,
+        profile=adapter_profile,
     )
     setattr(source, "_gateway_adapter_session_key", adapter_key)
     runner_key = runner._session_key_for_source(source)
@@ -297,7 +299,7 @@ def test_runner_uses_profiled_provisional_key_but_adapter_queue_key(tmp_path):
     runner._queue_or_replace_pending_event(runner_key, event)
 
     assert adapter._pending_messages[adapter_key] is event
-    assert runner_key not in adapter._pending_messages
+    assert set(adapter._pending_messages) == {adapter_key}
 
 
 @pytest.mark.asyncio
