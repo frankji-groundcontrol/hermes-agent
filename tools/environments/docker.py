@@ -606,6 +606,44 @@ def _egress_reuse_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
+_SPEC_LABEL_KEY = "hermes-spec"
+
+
+def _spec_reuse_fingerprint(
+    image: str,
+    cwd: str,
+    run_args: list,
+    env_values: dict,
+    image_uses_s6_init: bool,
+) -> str:
+    """Stable Docker-label digest of everything wiring a sandbox container.
+
+    The reuse identity labels (``hermes-task-id`` / ``hermes-profile``) are
+    derived from the task and shared-key strings alone, so after a terminal
+    config change (image, ``docker_env`` values, ``docker_volumes``,
+    ``docker_extra_args``, ...) label-based reuse silently reattached to the
+    OLD container and the new configuration never took effect.  Mirroring
+    the egress posture fingerprint, the full resolved spec — including env
+    VALUES, which deliberately never appear in argv or labels (#96268) — is
+    hashed into this label and included in reuse matching, so any spec
+    change starts a fresh container instead of reusing stale wiring.  Only
+    the one-way digest is stored; secret values never leak via
+    ``docker inspect``.
+    """
+    payload = json.dumps(
+        {
+            "image": image,
+            "cwd": cwd,
+            "s6_init": bool(image_uses_s6_init),
+            "run_args": list(run_args),
+            "env": {k: env_values[k] for k in sorted(env_values)},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
 def _egress_enforce_on_docker(default: bool = True) -> bool:
     """Read proxy.enforce_on_docker with fail-safe defaulting."""
     try:
@@ -1413,11 +1451,19 @@ class DockerEnvironment(BaseEnvironment):
         # container-start time and never changes for the container's lifetime.
         profile_name = _container_identity(shared_container_key)
         task_label = _sanitize_label_value(task_id)
+        # Fingerprint the resolved container spec (image, cwd, run args and
+        # env VALUES) so reuse can reject containers created under a
+        # different terminal configuration — the identity labels above stay
+        # stable for operators and the orphan reaper.
+        spec_label = _spec_reuse_fingerprint(
+            image, cwd, all_run_args, self._run_env_values, image_uses_s6_init,
+        )
         label_args = [
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
+            "--label", f"{_SPEC_LABEL_KEY}={spec_label}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -1430,6 +1476,7 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label,
+            _SPEC_LABEL_KEY: spec_label,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -1446,7 +1493,7 @@ class DockerEnvironment(BaseEnvironment):
         reused = False
         if persist_across_processes:
             existing = self._find_reusable_container(
-                task_label, profile_name, egress_label,
+                task_label, profile_name, egress_label, spec_label,
             )
             if existing is not None:
                 container_id, state = existing
@@ -1560,6 +1607,9 @@ class DockerEnvironment(BaseEnvironment):
                 raise
             self._container_id = result.stdout.strip()
             logger.info("Started container %s (%s)", container_name, self._container_id[:12])
+            # A fresh start under the current spec supersedes any same-slot
+            # containers left over from an older terminal configuration.
+            self._prune_superseded_containers(task_label, profile_name, spec_label)
 
         # Build the init-time env forwarding args used to seed the snapshot.
         self._init_env_args = self._build_init_env_args()
@@ -1742,6 +1792,7 @@ class DockerEnvironment(BaseEnvironment):
         profile_label = self._labels.get("hermes-profile", "")
         existing = self._find_reusable_container(
             task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            self._labels.get(_SPEC_LABEL_KEY, ""),
         )
         if existing is not None:
             cid, state = existing
@@ -1792,6 +1843,9 @@ class DockerEnvironment(BaseEnvironment):
                 logger.info(
                     "Recovery: created fresh container %s (%s)",
                     new_name, self._container_id[:12],
+                )
+                self._prune_superseded_containers(
+                    task_label, profile_label, self._labels.get(_SPEC_LABEL_KEY, ""),
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
                 logger.error("Recovery: failed to create new container: %s", e)
@@ -1907,8 +1961,9 @@ class DockerEnvironment(BaseEnvironment):
         task_label: str,
         profile_label: str,
         egress_label: str,
+        spec_label: str = "",
     ) -> Optional[tuple[str, str]]:
-        """Look for an existing container labeled for this (task, profile).
+        """Look for an existing container labeled for this (task, profile, spec).
 
         Returns ``(container_id, state)`` on hit, ``None`` on miss / on any
         failure (including ``docker ps`` itself failing). State is one of the
@@ -1926,6 +1981,13 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", f"label=hermes-task-id={task_label}",
                 "--filter", f"label=hermes-profile={profile_label}",
             ]
+            if spec_label:
+                # Containers started under a different terminal spec (image,
+                # env values, volumes, extra args) must not be reused — see
+                # _spec_reuse_fingerprint.
+                filters.extend(
+                    ["--filter", f"label={_SPEC_LABEL_KEY}={spec_label}"]
+                )
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
                 fmt = "{{.ID}}\t{{.State}}"
@@ -1993,6 +2055,65 @@ class DockerEnvironment(BaseEnvironment):
             if state == "running" and running is None:
                 running = (cid, state)
         return running or first
+
+    def _prune_superseded_containers(
+        self,
+        task_label: str,
+        profile_label: str,
+        spec_label: str,
+    ) -> None:
+        """Remove same-slot containers created under a different spec.
+
+        With the spec label in the reuse lookup these can never be attached
+        to again; leaving them running would leak one stale-wiring container
+        per terminal-config change.  Best-effort: failures only log.
+        """
+        fmt = '{{.ID}}\t{{.Label "' + _SPEC_LABEL_KEY + '"}}'
+        try:
+            result = subprocess.run(
+                [
+                    self._docker_exe, "ps", "-a",
+                    "--filter", "label=hermes-agent=1",
+                    "--filter", f"label=hermes-task-id={task_label}",
+                    "--filter", f"label=hermes-profile={profile_label}",
+                    "--format", fmt,
+                ],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10, check=False, stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug("Superseded-container probe failed: %s", e)
+            return
+        if result.returncode != 0:
+            logger.debug(
+                "Superseded-container probe returned %d: %s",
+                result.returncode, result.stderr.strip(),
+            )
+            return
+        for ln in result.stdout.splitlines():
+            parts = ln.split("\t")
+            if len(parts) != 2:
+                continue
+            cid, old_spec = parts[0].strip(), parts[1].strip()
+            if not cid or old_spec == spec_label:
+                continue
+            logger.info(
+                "Removing superseded container %s (task=%s, profile=%s, "
+                "spec %s != %s)",
+                cid[:12], task_label, profile_label, old_spec or "<none>",
+                spec_label,
+            )
+            try:
+                subprocess.run(
+                    [self._docker_exe, "rm", "-f", cid],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=30, check=False,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (subprocess.TimeoutExpired, OSError) as e:
+                logger.warning(
+                    "Failed to remove superseded container %s: %s", cid[:12], e,
+                )
 
     def cleanup(self, *, force_remove: bool = False):
         """Tear down the container according to persist mode and *force_remove*.

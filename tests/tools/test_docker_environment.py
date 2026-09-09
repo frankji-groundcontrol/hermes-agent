@@ -728,11 +728,14 @@ def test_labels_attribute_populated_after_init(monkeypatch):
 
     env = _make_dummy_env(task_id="abc")
 
+    spec = env._labels["hermes-spec"]
+    assert len(spec) == 24
     assert env._labels == {
         "hermes-agent": "1",
         "hermes-task-id": "abc",
         "hermes-profile": "default",
         "hermes-egress": "off",
+        "hermes-spec": spec,
     }
 
 
@@ -887,6 +890,11 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
             if sub == "ps":
+                cmd_str = " ".join(str(part) for part in cmd)
+                if "hermes-spec" in cmd_str and "{{.Label" in cmd_str:
+                    # Superseded-container prune probe (after the fresh run):
+                    # no leftovers in this scenario.
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
                 # Simulate an old pre-egress container: without the egress label
                 # filter it would match; with the filter Docker returns no match.
                 assert any(str(part).startswith("label=hermes-egress=") for part in cmd)
@@ -1725,3 +1733,156 @@ def test_docker_run_secret_values_never_in_argv(monkeypatch):
     assert "MY_TOKEN" in args
     assert all(secret not in str(a) for a in args)
     assert (kwargs.get("env") or {}).get("MY_TOKEN") == secret
+
+def test_spec_fingerprint_covers_env_values_and_run_args():
+    """The spec digest must change when env VALUES or run args change — those
+    never appear in argv or labels, so the digest is the only reuse guard."""
+    base = dict(
+        image="python:3.11",
+        cwd="/root",
+        run_args=["--user", "1000:1000"],
+        env_values={"TOKEN_A": "x", "TOKEN_B": "y"},
+        image_uses_s6_init=False,
+    )
+    a = docker_env._spec_reuse_fingerprint(**base)
+    assert a == docker_env._spec_reuse_fingerprint(**base)
+    assert len(a) == 24
+    assert a != docker_env._spec_reuse_fingerprint(
+        **dict(base, env_values={"TOKEN_A": "x2", "TOKEN_B": "y"})
+    )
+    assert a != docker_env._spec_reuse_fingerprint(
+        **dict(base, run_args=["--user", "0:0"])
+    )
+    assert a != docker_env._spec_reuse_fingerprint(**dict(base, image="python:3.12"))
+    assert a != docker_env._spec_reuse_fingerprint(**dict(base, image_uses_s6_init=True))
+
+
+def test_run_command_carries_spec_label(monkeypatch):
+    """docker run must carry hermes-spec and _labels must match, while env
+    values stay out of argv/labels (only the one-way digest ships)."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    secret = "s3cret-value-do-not-leak"
+    env = _make_dummy_env(task_id="spec-label", env={"MY_TOKEN": secret})
+
+    run_calls = [
+        c for c in calls
+        if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"
+    ]
+    assert run_calls, "docker run should have been called"
+    args = run_calls[0][0]
+    assert f"hermes-spec={env._labels['hermes-spec']}" in args
+    assert secret not in " ".join(args)
+    assert env._container_id
+
+
+def test_reuse_probe_filters_on_spec_label(monkeypatch):
+    """The reuse docker ps must filter by the current spec label so stale-
+    wiring containers no longer match (regression: shared containers were
+    reused with old env/mounts after terminal config changes)."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            sub = cmd[1]
+            if sub == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "ps":
+                cmd_str = " ".join(str(part) for part in cmd)
+                if "hermes-spec" in cmd_str and "{{.Label" in cmd_str:
+                    # Prune probe: nothing superseded.
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                assert any(
+                    str(part).startswith("label=hermes-spec=") for part in cmd
+                ), "reuse probe must filter on the spec label"
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if sub == "run":
+                return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env = _make_dummy_env(task_id="spec-filter")
+    assert env._container_id == "fresh-cid"
+
+
+def test_changed_spec_prunes_superseded_container(monkeypatch):
+    """After a fresh start under a new spec, same-slot containers carrying a
+    different spec label must be removed instead of leaking forever."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            sub = cmd[1]
+            if sub == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "ps":
+                cmd_str = " ".join(str(part) for part in cmd)
+                if "hermes-spec" in cmd_str and "{{.Label" in cmd_str:
+                    # Prune probe sees the pre-config-change container.
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout="stale-cid\t0123456789abcdef01234567\n", stderr=""
+                    )
+                # Reuse probe (spec filter on) sees nothing current.
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if sub == "run":
+                return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env = _make_dummy_env(task_id="spec-prune")
+    assert env._container_id == "fresh-cid"
+    rm_calls = [
+        c for c in calls
+        if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "rm"
+        and "stale-cid" in c[0]
+    ]
+    assert rm_calls, "superseded same-slot container must be removed after a fresh start"
+
+
+def test_same_spec_container_is_not_pruned(monkeypatch):
+    """The prune probe must skip containers whose spec label equals the
+    current one (they are the reuse targets, not the leftovers)."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    calls = []
+    seen_spec = {}
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            sub = cmd[1]
+            if sub == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "ps":
+                for part in cmd:
+                    if str(part).startswith("label=hermes-spec="):
+                        seen_spec["v"] = str(part)[len("label=hermes-spec="):]
+                cmd_str = " ".join(str(part) for part in cmd)
+                if "hermes-spec" in cmd_str and "{{.Label" in cmd_str:
+                    assert seen_spec.get("v"), "prune probe must run after the spec is known"
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout="same-cid\t" + seen_spec["v"] + "\n", stderr=""
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if sub == "run":
+                return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    _make_dummy_env(task_id="spec-keep")
+    rm_calls = [
+        c for c in calls
+        if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "rm"
+    ]
+    assert not rm_calls, f"same-spec container must not be pruned, got {rm_calls}"
