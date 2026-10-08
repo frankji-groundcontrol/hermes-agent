@@ -258,7 +258,7 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     runner = repo_root / "scripts" / "run_tests_parallel.py"
     return subprocess.run(
         [sys.executable, str(runner), "--paths", str(probe_dir),
-         "-j", str(jobs), "--file-timeout", "30", *extra],
+         "--file-timeout", "30", *extra],
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

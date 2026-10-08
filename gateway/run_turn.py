@@ -3113,6 +3113,8 @@ class GatewayTurnMixin:
 
         The connector will auto-thread on the reply anchor (thread is born on its FIRST send), so
         carrying it routes progress / status bubbles into the same thread as the final reply."""
+        if getattr(source, "reply_thread_anchor_id", None):
+            return self._thread_metadata_for_source(source, event_message_id)
         if not _progress_thread_id:
             metadata = None
         elif _progress_thread_id == source.thread_id:
@@ -3180,7 +3182,8 @@ class GatewayTurnMixin:
         # Buzz has no native thread_id: thread via reply-to unless the user opted out.
         _progress_reply_to = (
             event_message_id
-            if (source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id)
+            if (source.platform in (Platform.FEISHU, Platform.MATTERMOST)
+                and (source.thread_id or getattr(source, "reply_thread_anchor_id", None)) and event_message_id)
             or (is_buzz and event_message_id and _progress_reply_in_thread)
             or _relay_prospective_thread_id
             else None

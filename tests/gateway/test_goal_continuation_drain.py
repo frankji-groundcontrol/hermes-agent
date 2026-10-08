@@ -238,7 +238,7 @@ async def test_profiled_goal_uses_source_adapter_lane():
     adapter = SimpleNamespace(_pending_messages={adapter_key: continuation})
     default_adapter = SimpleNamespace(_pending_messages={})
     runner.adapters = {Platform.FEISHU: default_adapter}
-    runner._adapter_for_source = lambda _source: adapter
+    runner._delivery_adapter_for = lambda _source: adapter
     runner._session_key_for_source = lambda _source: runner_key
     manager = MagicMock()
     manager.pause.return_value = SimpleNamespace(goal="ship it")

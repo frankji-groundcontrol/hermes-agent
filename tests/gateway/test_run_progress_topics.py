@@ -1350,6 +1350,7 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
 async def test_run_agent_feishu_bootstrap_routes_interim_commentary(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,
@@ -1377,6 +1378,7 @@ async def test_run_agent_feishu_bootstrap_routes_interim_commentary(monkeypatch,
     assert interim["metadata"]["reply_to_message_id"] == "om_top"
     assert interim["metadata"]["reply_in_thread"] is True
     assert interim["metadata"]["strict_thread"] is True
+@pytest.mark.asyncio
 async def test_non_editable_interim_final_is_recorded_for_final_send_dedup(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,

@@ -289,7 +289,7 @@ def test_runner_uses_profiled_provisional_key_but_adapter_queue_key(tmp_path, ad
         "thread_sessions_per_user": True,
     }
     adapter._pending_messages = {}
-    runner._adapter_for_source = lambda _source: adapter
+    runner._delivery_adapter_for = lambda _source: adapter
     event = MessageEvent(
         text="follow up",
         message_type=MessageType.TEXT,
@@ -324,7 +324,7 @@ async def test_profiled_bootstrap_queue_uses_adapter_lane(tmp_path):
     adapter = MagicMock()
     adapter._pending_messages = {}
     adapter.get_pending_message.side_effect = adapter._pending_messages.pop
-    runner._adapter_for_source = lambda _source: adapter
+    runner._delivery_adapter_for = lambda _source: adapter
     event = MessageEvent(
         text="/queue follow up",
         message_type=MessageType.TEXT,

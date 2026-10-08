@@ -646,12 +646,12 @@ class GatewayAuthorizationMixin:
         # can bypass ``disabled``. Mention enforcement is an adapter concern
         # and is not re-checked here.
         if source.platform == Platform.FEISHU and source.chat_type in {"group", "forum"}:
-            adapter = self._adapter_for_source(source)
+            adapter = self._delivery_adapter_for(source)
             allowed_group_chats = getattr(adapter, "_allowed_group_chats", None)
             if allowed_group_chats is None:
                 from agent.secret_scope import is_multiplex_active
 
-                raw = "" if is_multiplex_active() else _platform_gate_env(
+                raw = "" if is_multiplex_active() else _auth_env(
                     "FEISHU_GROUP_ALLOWED_CHATS"
                 )
                 allowed_group_chats = parse_feishu_group_allowed_chats(raw)
@@ -659,14 +659,14 @@ class GatewayAuthorizationMixin:
                 group_policy = getattr(
                     adapter,
                     "_group_policy",
-                    _platform_gate_env("FEISHU_GROUP_POLICY", "allowlist"),
+                    _auth_env("FEISHU_GROUP_POLICY", "allowlist"),
                 )
                 if str(group_policy).strip().lower() == "disabled":
                     return False
                 allow_bots = getattr(
                     adapter,
                     "_allow_bots",
-                    _platform_gate_env("FEISHU_ALLOW_BOTS", "none"),
+                    _auth_env("FEISHU_ALLOW_BOTS", "none"),
                 )
                 allow_bots = str(allow_bots).strip().lower()
                 if source.is_bot and allow_bots not in {"mentions", "all"}:
